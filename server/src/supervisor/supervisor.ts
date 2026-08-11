@@ -23,7 +23,7 @@
 
 import type { Config } from "../config.ts";
 import { log } from "../log.ts";
-import type { PermissionRequest, PermissionWatcher } from "../opencode/permissions.ts";
+import type { PermissionReply, PermissionRequest } from "../opencode/permissions.ts";
 import { SPEECH_FORMAT, type PermissionResponse, type ServerMessage } from "../protocol.ts";
 import { SttClient, SttError } from "../stt/groq.ts";
 import { TtsEngine } from "../tts/kokoro.ts";
@@ -33,6 +33,22 @@ import { askQuestion, outcomeSentence, repromptQuestion } from "./speech.ts";
 export interface SupervisorSink {
   send(msg: ServerMessage): void;
   sendAudio(turn: number, pcm: Buffer): void;
+}
+
+/**
+ * How to act on a request, supplied per request rather than per supervisor.
+ *
+ * Both halves are properties of the session that raised the question, not of
+ * the client being asked it: with a workspace per project there is a permission
+ * stream per workspace, so "which server do I answer" has to travel with the
+ * request. Phase 5 widens this into an approval-request abstraction that
+ * Yammer's own destructive commands can also present.
+ */
+export interface PermissionContext {
+  /** Answer the request, unblocking the tool call either way. */
+  reply(id: string, reply: PermissionReply): Promise<void>;
+  /** Stop the agent that raised it. Only the no-answer path uses this. */
+  abortTurn(): Promise<void>;
 }
 
 /** Biases Whisper toward the words we actually expect. Cheap, and it works. */
@@ -54,11 +70,9 @@ interface PendingAnswer {
 
 export class PermissionSupervisor {
   private readonly sink: SupervisorSink;
-  private readonly watcher: PermissionWatcher;
   private readonly stt: SttClient;
   private readonly tts: TtsEngine;
   private readonly config: Config["supervisor"];
-  private readonly abortTurn: () => Promise<void>;
 
   private pending: PendingAnswer | null = null;
   /** Set when a request in the current turn was refused, so the turn manager
@@ -69,18 +83,14 @@ export class PermissionSupervisor {
 
   constructor(
     sink: SupervisorSink,
-    watcher: PermissionWatcher,
     stt: SttClient,
     tts: TtsEngine,
     config: Config["supervisor"],
-    abortTurn: () => Promise<void>,
   ) {
     this.sink = sink;
-    this.watcher = watcher;
     this.stt = stt;
     this.tts = tts;
     this.config = config;
-    this.abortTurn = abortTurn;
   }
 
   /** True if the given turn was ended by a refusal rather than by an error. */
@@ -96,12 +106,17 @@ export class PermissionSupervisor {
    * Ask, listen, answer. Resolves once the request is settled either way; the
    * caller does not wait on this — OpenCode's blocked prompt call is what waits.
    */
-  async handle(request: PermissionRequest, turn: number, signal: AbortSignal): Promise<void> {
+  async handle(
+    request: PermissionRequest,
+    turn: number,
+    signal: AbortSignal,
+    context: PermissionContext,
+  ): Promise<void> {
     log.info("supervising permission", { id: request.id, turn });
 
     try {
       for (let attempt = 0; attempt < this.config.maxAttempts; attempt += 1) {
-        if (signal.aborted) return await this.settle(request, turn, "reject", false);
+        if (signal.aborted) return await this.settle(request, turn, "reject", false, context);
 
         const question =
           attempt === 0
@@ -116,15 +131,21 @@ export class PermissionSupervisor {
           attempt,
         });
         await this.speak(turn, question, signal);
-        if (signal.aborted) return await this.settle(request, turn, "reject", false);
+        if (signal.aborted) return await this.settle(request, turn, "reject", false, context);
 
         const audio = await this.collectAnswer(turn, request.id);
         const match = await this.classify(audio);
         this.lastMiss = match.kind === "silence" ? "silence" : "unrecognized";
 
-        if (match.kind === "approve") return await this.settle(request, turn, "once", true);
-        if (match.kind === "always") return await this.settle(request, turn, "always", true);
-        if (match.kind === "deny") return await this.settle(request, turn, "reject", true);
+        if (match.kind === "approve") {
+          return await this.settle(request, turn, "once", true, context);
+        }
+        if (match.kind === "always") {
+          return await this.settle(request, turn, "always", true, context);
+        }
+        if (match.kind === "deny") {
+          return await this.settle(request, turn, "reject", true, context);
+        }
 
         log.info("answer not recognized", {
           id: request.id,
@@ -135,7 +156,7 @@ export class PermissionSupervisor {
       }
 
       // Out of attempts: treat it as nobody being there.
-      await this.settle(request, turn, "timeout", true);
+      await this.settle(request, turn, "timeout", true, context);
     } catch (cause) {
       log.error("supervisor failed", { id: request.id, error: String(cause) });
       this.sink.send({
@@ -145,7 +166,7 @@ export class PermissionSupervisor {
         message: "The approval prompt failed, so I denied it.",
       });
       // Never leave OpenCode blocked on a prompt we can no longer drive.
-      await this.settle(request, turn, "timeout", false).catch(() => {});
+      await this.settle(request, turn, "timeout", false, context).catch(() => {});
     }
   }
 
@@ -161,10 +182,11 @@ export class PermissionSupervisor {
     turn: number,
     response: PermissionResponse,
     speakOutcome: boolean,
+    context: PermissionContext,
   ): Promise<void> {
     const reply = response === "timeout" ? "reject" : response;
     try {
-      await this.watcher.reply(request.id, reply);
+      await context.reply(request.id, reply);
     } catch (cause) {
       log.error("could not answer permission", { id: request.id, error: String(cause) });
     }
@@ -173,7 +195,7 @@ export class PermissionSupervisor {
 
     if (response === "timeout") {
       try {
-        await this.abortTurn();
+        await context.abortTurn();
       } catch (cause) {
         log.warn("could not abort the turn after a timeout", { error: String(cause) });
       }
@@ -283,9 +305,9 @@ export class PermissionSupervisor {
    * or no client attached. Leaving it unanswered would wedge `opencode serve`
    * holding a blocked tool call indefinitely.
    */
-  async refuse(request: PermissionRequest): Promise<void> {
+  async refuse(request: PermissionRequest, context: PermissionContext): Promise<void> {
     try {
-      await this.watcher.reply(request.id, "reject");
+      await context.reply(request.id, "reject");
     } catch (cause) {
       log.error("could not refuse an unattended permission", {
         id: request.id,

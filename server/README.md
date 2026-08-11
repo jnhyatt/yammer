@@ -67,6 +67,8 @@ halves of the system.
 | `YAMMER_OPENCODE_PROVIDER` | *(OpenCode's default)* | See "OpenCode model" below before relying on the default |
 | `YAMMER_OPENCODE_MODEL` | *(OpenCode's default)* | |
 | `YAMMER_OPENCODE_AGENT` | `yammer` | The TTS-aware agent; see "OpenCode agent" below |
+| `YAMMER_STATE_DIR` | *(platform data dir)* | Holds `workspaces.json`; `~/.local/share/yammer` on Linux |
+| `YAMMER_PODMAN_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Read at startup to check the workspace registry against reality |
 | `YAMMER_SUPERVISOR_VOICE` | `bm_george` | Approval-prompt voice; must differ audibly from `YAMMER_TTS_VOICE` |
 | `YAMMER_SUPERVISOR_ANSWER_SECONDS` | `12` | How long one answer window stays open |
 | `YAMMER_SUPERVISOR_MAX_ATTEMPTS` | `3` | Asks before giving up, then rejects and aborts |
@@ -79,13 +81,13 @@ halves of the system.
 ### OpenCode model
 
 Leaving `YAMMER_OPENCODE_PROVIDER`/`YAMMER_OPENCODE_MODEL` unset makes
-`OpenCodeSession` ask OpenCode for its own default (`client.config.providers()`,
+`OpenCodeClient` ask OpenCode for its own default (`client.config.providers()`,
 first provider's default model). That default is **not guaranteed to be a model
 your OpenCode account can actually use** — it errors on every forwarded turn if
 not, since the failure only surfaces on the first real prompt call.
 
 `opencode/deepseek-v4-flash-free` is a verified-working pair — confirmed with a
-real prompt through `OpenCodeSession.prompt()` end to end, no extra credentials
+real prompt through `OpenCodeClient.prompt()` end to end, no extra credentials
 (it's on OpenCode's own built-in `opencode` provider), no cost. Set both:
 
 ```sh
@@ -261,15 +263,21 @@ real CUDA install and a modern GPU only needs step 1 (the EP binary) and
 ```
 src/
   index.ts            entrypoint: config, warm-up, listen
+  startup.ts          reads the workspace registry and checks it against Podman
   config.ts           environment → Config
   protocol.ts         wire types + codecs (mirrors ../protocol/PROTOCOL.md)
   ws-server.ts        handshake, framing, connection lifecycle
   turn.ts             turn state machine: STT → route → act → speak
+  workspace.ts        projects, and the sessions clients hold in them
   wav.ts              PCM/WAV helpers
   stt/groq.ts         OpenAI-compatible transcription
+  container/runtime.ts     what Yammer needs from a container runtime
+  container/podman.ts      that, over Podman's REST socket
+  registry/store.ts        the workspace registry's file on disk
+  registry/reconcile.ts    registry vs. reality, as a pure diff
   router/commands.ts  the meta-command catalogue
   router/router.ts    the routing LLM call
-  opencode/session.ts one continuous OpenCode session per sitting
+  opencode/client.ts  the HTTP client for one workspace's OpenCode
   opencode/permissions.ts  watches for blocked tool calls, answers them
   supervisor/supervisor.ts spoken approval prompt in a second voice
   supervisor/keywords.ts   approve/always/deny matching (pure, tested)
@@ -283,10 +291,20 @@ src/
 npm test        # node --test over src/**/*.test.ts
 ```
 
-Only `supervisor/keywords.ts` is covered, deliberately. Everything else in this
-repo fails loudly — a bad model id 404s, a protocol mismatch closes the socket —
-but a mistranscription classified as "approve" force-pushes a branch and looks
-like nothing went wrong. The fixtures are real Whisper output shapes.
+Coverage is deliberately narrow, and the thing every suite has in common is that
+it guards a **silent** failure. Most of this repo fails loudly — a bad model id
+404s, a protocol mismatch closes the socket — so those paths need no test.
+
+- `supervisor/keywords.test.ts` — a mistranscription classified as "approve"
+  force-pushes a branch and looks like nothing went wrong. The fixtures are real
+  Whisper output shapes.
+- `protocol.test.ts` — cross-language codec conformance, against frames dumped
+  from the real Python client.
+- `ws-server.test.ts` — handshake, close codes, busy rejection, permission
+  routing, and the invariant that every turn exit path emits `turn.end`.
+- `registry/store.test.ts` and `registry/reconcile.test.ts` — a workspace that
+  quietly drops out of the registry, or a status that is confidently wrong,
+  produce no error at the time and a mystery later.
 
 ## Evaluating router models
 

@@ -23,8 +23,11 @@ import { WebSocket } from "ws";
 
 import type { Config } from "./config.ts";
 import { setLogLevel } from "./log.ts";
+import type { PermissionRequest, PermissionWatcher } from "./opencode/permissions.ts";
+import type { OpenCodeClient } from "./opencode/client.ts";
 import { CloseCode, PROTOCOL_VERSION, SPEECH_FORMAT, encodeAudioFrame } from "./protocol.ts";
 import { SttError } from "./stt/groq.ts";
+import { Workspace, WorkspaceRegistry } from "./workspace.ts";
 import { startServer, type Deps } from "./ws-server.ts";
 
 const TOKEN = "s3cret-token";
@@ -50,8 +53,19 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+/** Poll for something that happens server-side and sends no frame of its own. */
+async function waitFor(condition: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + TIMEOUT_MS;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 interface FakeOptions {
   transcribe?: (audio: Buffer) => Promise<string>;
+  /** Answers only. Separate because the supervisor's answers go through STT too. */
+  transcribeAnswer?: (audio: Buffer) => Promise<string>;
   route?: () => Promise<{ action: string }>;
   prompt?: () => Promise<string>;
 }
@@ -60,13 +74,33 @@ interface FakeOptions {
 interface Recorder {
   audio: Buffer[];
   prompts: string[];
+  /** Permission ids answered, and with what. */
+  replies: Array<{ id: string; reply: string }>;
 }
 
-function makeDeps(options: FakeOptions = {}): { deps: Deps; recorder: Recorder } {
-  const recorder: Recorder = { audio: [], prompts: [] };
+/** The seam the workspace's permission stream is driven through. */
+interface Harness {
+  deps: Deps;
+  recorder: Recorder;
+  workspace: Workspace;
+  /** The session id the fake OpenCode hands out, once one has been created. */
+  sessionId(): string | null;
+  /** Publish a `permission.asked` as OpenCode would. */
+  emitPermission(request: Partial<PermissionRequest> & { sessionID: string }): void;
+}
+
+const TEST_WORKSPACE = "testproject";
+
+function makeDeps(options: FakeOptions = {}): Harness {
+  const recorder: Recorder = { audio: [], prompts: [], replies: [] };
 
   const stt = {
-    transcribe: async (audio: Buffer) => {
+    transcribe: async (audio: Buffer, _signal?: AbortSignal, opts?: { prompt?: string }) => {
+      // The supervisor passes a bias prompt; the turn pipeline does not. That
+      // is the only thing distinguishing an answer from an utterance here.
+      if (opts?.prompt !== undefined) {
+        return options.transcribeAnswer ? options.transcribeAnswer(audio) : "approve";
+      }
       recorder.audio.push(audio);
       return options.transcribe ? options.transcribe(audio) : "add a test";
     },
@@ -76,9 +110,13 @@ function makeDeps(options: FakeOptions = {}): { deps: Deps; recorder: Recorder }
     route: async () => (options.route ? options.route() : { action: "forward" }),
   };
 
+  let sessionId: string | null = null;
   const opencode = {
-    currentSessionId: "ses_test",
-    prompt: async (text: string) => {
+    createSession: async () => {
+      sessionId = "ses_test";
+      return sessionId;
+    },
+    prompt: async (_id: string, text: string) => {
       recorder.prompts.push(text);
       return options.prompt ? options.prompt() : "Done.";
     },
@@ -92,14 +130,46 @@ function makeDeps(options: FakeOptions = {}): { deps: Deps; recorder: Recorder }
     },
   };
 
-  const permissions = { onAsked: () => {} };
+  let asked: ((request: PermissionRequest) => void) | null = null;
+  const permissions = {
+    onAsked: (handler: (request: PermissionRequest) => void) => {
+      asked = handler;
+    },
+    start: () => {},
+    stop: () => {},
+    reply: async (id: string, reply: string) => {
+      recorder.replies.push({ id, reply });
+    },
+  };
 
   // The concrete classes carry private fields, so structural assignment won't
   // do. These fakes implement everything the server path touches; the cast is
   // the price of not standing up Groq, OpenRouter, OpenCode and Kokoro.
+  const workspace = new Workspace({
+    name: TEST_WORKSPACE,
+    workDir: "/tmp",
+    baseUrl: "http://127.0.0.1:0",
+    opencode: opencode as unknown as OpenCodeClient,
+    permissions: permissions as unknown as PermissionWatcher,
+  });
+  const workspaces = new WorkspaceRegistry([workspace], TEST_WORKSPACE);
+
   return {
-    deps: { stt, router, opencode, tts, permissions } as unknown as Deps,
+    deps: { stt, router, workspaces, tts } as unknown as Deps,
     recorder,
+    workspace,
+    sessionId: () => sessionId,
+    emitPermission: (request) => {
+      assert.ok(asked, "workspace is not watching its permission stream");
+      asked({
+        id: "per_test",
+        permission: "bash",
+        patterns: ["rm -rf ."],
+        metadata: { command: "rm -rf ." },
+        always: ["rm *"],
+        ...request,
+      });
+    },
   };
 }
 
@@ -111,6 +181,8 @@ function testConfig(): Config {
     stt: { baseUrl: "", apiKey: "", model: "" },
     router: { baseUrl: "", apiKey: "", model: "" },
     opencode: { baseUrl: "", projectDir: "/tmp", agent: "yammer" },
+    state: { dir: "/tmp" },
+    container: { socketPath: "/nonexistent.sock" },
     supervisor: { voice: "bm_george", answerSeconds: 12, maxAttempts: 3 },
     tts: { modelId: "", dtype: "q8", voice: "af_heart", device: "cpu" },
     logLevel: "error",
@@ -472,6 +544,99 @@ describe("turn lifecycle", () => {
 
       client.send(JSON.stringify({ t: "utterance.begin", turn: 6 }));
       assert.equal((await client.ofType("turn.accepted"))["turn"], 6);
+    });
+  });
+});
+
+// --- Permission routing ----------------------------------------------------
+
+describe("permission routing", () => {
+  // OpenCode publishes permissions per *server*, not per conversation, so with
+  // more than one session in flight the session id is the only thing that says
+  // whose question it is. Both failures here are silent ones: a misrouted
+  // request gets someone else's answer, and an unrouted one wedges `opencode
+  // serve` holding a blocked tool call forever.
+
+  it("refuses a permission for a session no client owns", async () => {
+    const harness = makeDeps();
+    harness.workspace.startWatching();
+
+    await withServer(harness.deps, async (connect) => {
+      const client = connect();
+      await client.hello();
+      await client.ofType("hello.ok");
+
+      // Another OpenCode client's prompt, or a session whose client has gone.
+      harness.emitPermission({ id: "per_stray", sessionID: "ses_somebody_else" });
+
+      await waitFor(() => harness.recorder.replies.length > 0, "the refusal");
+      assert.deepEqual(harness.recorder.replies, [{ id: "per_stray", reply: "reject" }]);
+      assert.ok(
+        !client.seen().includes("permission.ask"),
+        "the connected client must not be asked about someone else's tool call",
+      );
+    });
+  });
+
+  it("asks the owning client, and tells OpenCode what it heard", async () => {
+    const gate = deferred<string>();
+    const harness = makeDeps({ prompt: () => gate.promise });
+    harness.workspace.startWatching();
+
+    await withServer(harness.deps, async (connect) => {
+      const client = connect();
+      await client.hello();
+      await client.ofType("hello.ok");
+
+      client.send(JSON.stringify({ t: "utterance.begin", turn: 20 }));
+      await client.ofType("turn.accepted");
+      client.send(JSON.stringify({ t: "utterance.end", turn: 20 }));
+
+      // The session is created on the way into the prompt, which is also when
+      // its permissions start being routed here.
+      await waitFor(() => harness.sessionId() !== null, "the session to be created");
+      harness.emitPermission({ sessionID: harness.sessionId()! });
+
+      const ask = await client.ofType("permission.ask");
+      assert.equal(ask["turn"], 20, "the prompt belongs to the turn already in flight");
+      assert.equal(ask["id"], "per_test");
+
+      client.send(JSON.stringify({ t: "answer.begin", turn: 20, id: "per_test" }));
+      client.send(encodeAudioFrame(20, Buffer.from([1, 0])));
+      client.send(JSON.stringify({ t: "answer.end", turn: 20, id: "per_test" }));
+
+      const resolved = await client.ofType("permission.resolved");
+      assert.equal(resolved["response"], "once");
+      assert.deepEqual(harness.recorder.replies, [{ id: "per_test", reply: "once" }]);
+
+      // Approving lets the agent finish, so the turn ends normally.
+      gate.resolve("Done.");
+      assert.equal((await client.ofType("turn.end"))["outcome"], "forwarded");
+    });
+  });
+
+  it("refuses a permission that arrives with no turn in flight", async () => {
+    const gate = deferred<string>();
+    const harness = makeDeps({ prompt: () => gate.promise });
+    harness.workspace.startWatching();
+
+    await withServer(harness.deps, async (connect) => {
+      const client = connect();
+      await client.hello();
+      await client.ofType("hello.ok");
+
+      client.send(JSON.stringify({ t: "utterance.begin", turn: 21 }));
+      await client.ofType("turn.accepted");
+      client.send(JSON.stringify({ t: "utterance.end", turn: 21 }));
+      await waitFor(() => harness.sessionId() !== null, "the session to be created");
+
+      gate.resolve("Done.");
+      await client.ofType("turn.end");
+
+      // The session is still claimed, but there is nobody mid-turn to ask.
+      harness.emitPermission({ id: "per_late", sessionID: harness.sessionId()! });
+      await waitFor(() => harness.recorder.replies.length > 0, "the refusal");
+      assert.deepEqual(harness.recorder.replies, [{ id: "per_late", reply: "reject" }]);
     });
   });
 });

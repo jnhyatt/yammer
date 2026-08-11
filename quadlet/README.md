@@ -69,7 +69,7 @@ Same pattern with `yammer-opencode-build`/`yammer-opencode` if the
 
 - **`YAMMER_PROJECT_DIR` means something different here than in
   `server/.env`.** The value is only ever sent to OpenCode as its `directory`
-  parameter (`server/src/opencode/session.ts`) — it's resolved on the
+  parameter (`server/src/opencode/client.ts`) — it's resolved on the
   filesystem of whichever process *is* OpenCode, never read locally by
   `yammer-server`. Containerized, that's `yammer-opencode`'s filesystem, where
   the repo is mounted at `/workspace`. `yammer-server.container` sets

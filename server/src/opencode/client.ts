@@ -1,17 +1,24 @@
 /**
- * OpenCode integration.
+ * The HTTP client for one OpenCode server.
  *
- * One continuous session per work sitting, not one per utterance. The session
- * is reset only by the `new_session` meta-command.
+ * One of these exists per workspace, because one `opencode serve` exists per
+ * workspace. It owns everything that is a property of *that server* — its base
+ * URL, the directory its filesystem access is scoped to, the resolved model, and
+ * whether it knows our agent.
+ *
+ * What it deliberately does not own is a session id. Sessions belong to a
+ * (client, workspace) pair rather than to the workspace, so every session-scoped
+ * call here takes the id explicitly and `WorkspaceSession` in `workspace.ts` is
+ * what holds one. Two people talking to the same project get two conversations;
+ * they share this client, and OpenCode handles the concurrency (verified against
+ * a live server: two sessions prompting the same directory overlapped for ~18s
+ * and produced a consistent tree).
  *
  * Uses `opencode serve` + the official SDK rather than shelling out to the CLI.
- * Filesystem scope comes from the `directory` on the client config, so every
- * call is confined to the configured project directory.
  */
 
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk";
 
-import type { Config } from "../config.ts";
 import { log } from "../log.ts";
 
 export class OpenCodeError extends Error {
@@ -35,52 +42,63 @@ export interface UsageStats {
   outputTokens: number;
 }
 
-/** Structural contract the meta-commands depend on. */
-export interface SessionController {
-  prompt(text: string, signal?: AbortSignal): Promise<string>;
-  startNewSession(): Promise<void>;
-  compact(): Promise<void>;
-  usage(): Promise<UsageStats>;
+/**
+ * Where one OpenCode server lives and how to talk to it.
+ *
+ * Deliberately not `Config["opencode"]`: from phase 2 these are per-container
+ * values with a dynamically allocated port, not global configuration.
+ */
+export interface OpenCodeClientOptions {
+  baseUrl: string;
+  /** The directory OpenCode's filesystem access is scoped to. */
+  directory: string;
+  /** Optional provider/model override for OpenCode itself. */
+  providerId?: string;
+  modelId?: string;
+  /** OpenCode agent to prompt with — Yammer's own TTS-aware one by default. */
+  agent: string;
 }
 
-export class OpenCodeSession implements SessionController {
-  private readonly config: Config["opencode"];
+export class OpenCodeClient {
+  private readonly options: OpenCodeClientOptions;
   private readonly client: OpencodeClient;
-  private sessionId: string | null = null;
   private model: ModelRef | null = null;
 
-  constructor(config: Config["opencode"]) {
-    this.config = config;
+  constructor(options: OpenCodeClientOptions) {
+    this.options = options;
     this.client = createOpencodeClient({
-      baseUrl: config.baseUrl,
-      directory: config.projectDir,
+      baseUrl: options.baseUrl,
+      directory: options.directory,
     });
   }
 
-  /** Null until the first turn of the sitting creates a session. */
-  get currentSessionId(): string | null {
-    return this.sessionId;
+  get agent(): string {
+    return this.options.agent;
   }
 
   /**
    * Resolve the provider/model to use. Explicit config wins; otherwise take
    * OpenCode's own default so the server doesn't have to hardcode one.
+   *
+   * Cached per client, which means per workspace: OpenCode's default may point
+   * at a model the account cannot use, and that failure now surfaces the first
+   * time each workspace is prompted rather than once per boot.
    */
   private async resolveModel(): Promise<ModelRef> {
     if (this.model) return this.model;
 
-    if (this.config.providerId && this.config.modelId) {
-      this.model = { providerID: this.config.providerId, modelID: this.config.modelId };
+    if (this.options.providerId && this.options.modelId) {
+      this.model = { providerID: this.options.providerId, modelID: this.options.modelId };
       return this.model;
     }
 
     const response = await this.call(() => this.client.config.providers());
     const defaults = response?.default ?? {};
-    const providerID = this.config.providerId ?? Object.keys(defaults)[0];
+    const providerID = this.options.providerId ?? Object.keys(defaults)[0];
     if (!providerID) {
       throw new OpenCodeError("OpenCode reported no configured providers", "error");
     }
-    const modelID = this.config.modelId ?? defaults[providerID];
+    const modelID = this.options.modelId ?? defaults[providerID];
     if (!modelID) {
       throw new OpenCodeError(
         `OpenCode reported no default model for provider ${providerID}`,
@@ -112,26 +130,25 @@ export class OpenCodeSession implements SessionController {
         .filter((name): name is string => typeof name === "string");
     } catch (error) {
       log.warn("could not verify OpenCode agent", {
-        agent: this.config.agent,
+        agent: this.options.agent,
         error: error instanceof Error ? error.message : String(error),
       });
       return;
     }
 
-    if (names.includes(this.config.agent)) {
-      log.info("opencode agent available", { agent: this.config.agent });
+    if (names.includes(this.options.agent)) {
+      log.info("opencode agent available", { agent: this.options.agent });
       return;
     }
     log.warn("configured OpenCode agent is unknown — replies will not be TTS-shaped", {
-      agent: this.config.agent,
+      agent: this.options.agent,
       available: names.join(",") || "(none)",
       hint: "restart opencode serve if the agent file is new",
     });
   }
 
-  private async ensureSession(): Promise<string> {
-    if (this.sessionId) return this.sessionId;
-
+  /** Start a conversation. The caller owns the returned id. */
+  async createSession(): Promise<string> {
     const session = await this.call(() =>
       this.client.session.create({
         body: { title: `Yammer ${new Date().toISOString()}` },
@@ -141,8 +158,6 @@ export class OpenCodeSession implements SessionController {
     if (typeof id !== "string") {
       throw new OpenCodeError("session create returned no id", "error");
     }
-    this.sessionId = id;
-    log.info("opencode session started", { session: id });
     return id;
   }
 
@@ -155,15 +170,14 @@ export class OpenCodeSession implements SessionController {
    * headings, lists, code, and paths. OpenCode's default agent formats for a
    * screen, and Kokoro reads that formatting out loud.
    */
-  async prompt(text: string, signal?: AbortSignal): Promise<string> {
-    const id = await this.ensureSession();
+  async prompt(sessionId: string, text: string, signal?: AbortSignal): Promise<string> {
     const model = await this.resolveModel();
 
     const started = Date.now();
     const result = await this.call(() =>
       this.client.session.prompt({
-        path: { id },
-        body: { model, agent: this.config.agent, parts: [{ type: "text", text }] },
+        path: { id: sessionId },
+        body: { model, agent: this.options.agent, parts: [{ type: "text", text }] },
         signal,
       }),
     );
@@ -186,40 +200,23 @@ export class OpenCodeSession implements SessionController {
    * lands in the history as a terminal error state, leaving nothing dangling
    * for the next prompt to choke on.
    */
-  async abort(): Promise<void> {
-    const id = this.sessionId;
-    if (!id) return;
-    await this.call(() => this.client.session.abort({ path: { id } }));
-    log.info("opencode turn aborted", { session: id });
+  async abort(sessionId: string): Promise<void> {
+    await this.call(() => this.client.session.abort({ path: { id: sessionId } }));
+    log.info("opencode turn aborted", { session: sessionId });
   }
 
-  async startNewSession(): Promise<void> {
-    const session = await this.call(() =>
-      this.client.session.create({
-        body: { title: `Yammer ${new Date().toISOString()}` },
-      }),
-    );
-    const id = (session as { id?: unknown } | undefined)?.id;
-    if (typeof id !== "string") {
-      throw new OpenCodeError("session create returned no id", "error");
-    }
-    const previous = this.sessionId;
-    this.sessionId = id;
-    log.info("opencode session replaced", { previous, session: id });
-  }
-
-  async compact(): Promise<void> {
-    const id = await this.ensureSession();
+  async compact(sessionId: string): Promise<void> {
     const model = await this.resolveModel();
     await this.call(() =>
-      this.client.session.summarize({ path: { id }, body: model }),
+      this.client.session.summarize({ path: { id: sessionId }, body: model }),
     );
-    log.info("opencode session compacted", { session: id });
+    log.info("opencode session compacted", { session: sessionId });
   }
 
-  async usage(): Promise<UsageStats> {
-    const id = await this.ensureSession();
-    const messages = await this.call(() => this.client.session.messages({ path: { id } }));
+  async usage(sessionId: string): Promise<UsageStats> {
+    const messages = await this.call(() =>
+      this.client.session.messages({ path: { id: sessionId } }),
+    );
 
     const stats: UsageStats = { messages: 0, cost: 0, inputTokens: 0, outputTokens: 0 };
     for (const entry of Array.isArray(messages) ? messages : []) {

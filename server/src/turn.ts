@@ -11,13 +11,15 @@
  */
 
 import { log } from "./log.ts";
-import { OpenCodeError, type OpenCodeSession } from "./opencode/session.ts";
+import { OpenCodeError } from "./opencode/client.ts";
+import type { PermissionRequest } from "./opencode/permissions.ts";
 import { SPEECH_FORMAT, type ErrorCode, type ServerMessage, type TurnOutcome } from "./protocol.ts";
 import { findCommand } from "./router/commands.ts";
 import { RouterError, type Router } from "./router/router.ts";
 import { SttClient, SttError } from "./stt/groq.ts";
-import type { PermissionSupervisor } from "./supervisor/supervisor.ts";
+import type { PermissionContext, PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine, TtsError } from "./tts/kokoro.ts";
+import type { ClientWorkspaces, WorkspaceSession } from "./workspace.ts";
 
 /** How the orchestrator talks back to whoever owns the socket. */
 export interface TurnSink {
@@ -32,6 +34,14 @@ interface ActiveTurn {
   /** Set once utterance.end arrives and the pipeline starts. */
   processing: boolean;
   abort: AbortController;
+  /**
+   * The conversation this turn runs in, resolved when the pipeline starts.
+   *
+   * Held for the life of the turn rather than looked up again, so that a
+   * workspace switch cannot land halfway through one and leave the reply, the
+   * permission prompts, and the abort pointing at different projects.
+   */
+  session: WorkspaceSession | null;
 }
 
 /** Guard against a stuck client streaming forever. 60s at 16 kHz mono s16le. */
@@ -41,7 +51,7 @@ export class TurnManager {
   private readonly sink: TurnSink;
   private readonly stt: SttClient;
   private readonly router: Router;
-  private readonly opencode: OpenCodeSession;
+  private readonly client: ClientWorkspaces;
   private readonly tts: TtsEngine;
   private readonly supervisor: PermissionSupervisor;
 
@@ -52,14 +62,14 @@ export class TurnManager {
     sink: TurnSink,
     stt: SttClient,
     router: Router,
-    opencode: OpenCodeSession,
+    client: ClientWorkspaces,
     tts: TtsEngine,
     supervisor: PermissionSupervisor,
   ) {
     this.sink = sink;
     this.stt = stt;
     this.router = router;
-    this.opencode = opencode;
+    this.client = client;
     this.tts = tts;
     this.supervisor = supervisor;
   }
@@ -69,16 +79,27 @@ export class TurnManager {
    *
    * Only meaningful while a turn is in flight — a permission with no turn to
    * attach to has nobody listening, so it is refused rather than left blocking
-   * OpenCode forever.
+   * OpenCode forever. The workspace has already routed this to the client that
+   * owns the session; what is checked here is that the session is also the one
+   * this client is currently talking in, which is not the same thing once a
+   * client holds conversations in several workspaces at once.
    */
-  handlePermission(request: Parameters<PermissionSupervisor["handle"]>[0]): void {
+  handlePermission(request: PermissionRequest, context: PermissionContext): void {
     const active = this.active;
     if (!active || !active.processing) {
       log.warn("permission asked with no turn in flight, refusing", { id: request.id });
-      void this.supervisor.refuse(request);
+      void this.supervisor.refuse(request, context);
       return;
     }
-    void this.supervisor.handle(request, active.id, active.abort.signal);
+    if (active.session?.currentSessionId !== request.sessionID) {
+      log.warn("permission asked in a session the current turn is not using, refusing", {
+        id: request.id,
+        session: request.sessionID,
+      });
+      void this.supervisor.refuse(request, context);
+      return;
+    }
+    void this.supervisor.handle(request, active.id, active.abort.signal, context);
   }
 
   /** Route an answer frame, or fall through to ordinary utterance audio. */
@@ -111,6 +132,7 @@ export class TurnManager {
       bytes: 0,
       processing: false,
       abort: new AbortController(),
+      session: null,
     };
     this.sink.send({ t: "turn.accepted", turn });
     log.debug("utterance started", { turn });
@@ -177,7 +199,16 @@ export class TurnManager {
     const id = turn.id;
     const signal = turn.abort.signal;
     const audio = Buffer.concat(turn.chunks);
-    log.info("processing utterance", { turn: id, bytes: audio.length });
+
+    // Resolved once, here, rather than held from construction: which project a
+    // turn belongs to is a property of the client's state when it speaks.
+    const session = this.client.session();
+    turn.session = session;
+    log.info("processing utterance", {
+      turn: id,
+      bytes: audio.length,
+      workspace: session.workspace.name,
+    });
 
     let transcript: string;
     try {
@@ -194,7 +225,7 @@ export class TurnManager {
       this.sink.send({ t: "turn.status", turn: id, state: "routing" });
       const decision = await this.router.route(
         transcript,
-        { sessionId: this.opencode.currentSessionId, turnCount: this.replyCount },
+        { sessionId: session.currentSessionId, turnCount: this.replyCount },
         signal,
       );
       action = decision.action;
@@ -209,7 +240,7 @@ export class TurnManager {
     let outcome: TurnOutcome;
     if (action === "forward") {
       try {
-        spoken = await this.opencode.prompt(transcript, signal);
+        spoken = await session.prompt(transcript, signal);
         this.replyCount += 1;
         outcome = "forwarded";
       } catch (cause) {
@@ -231,7 +262,7 @@ export class TurnManager {
         return this.fail(id, "internal", "I didn't understand that command.", action);
       }
       try {
-        spoken = await command.run(this.opencode);
+        spoken = await command.run(session);
         outcome = "meta_command";
       } catch (cause) {
         console.log(cause);

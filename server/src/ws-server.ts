@@ -11,7 +11,6 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import type { Config } from "./config.ts";
 import { log } from "./log.ts";
-import { OpenCodeSession } from "./opencode/session.ts";
 import {
   CloseCode,
   PROTOCOL_VERSION,
@@ -23,12 +22,12 @@ import {
   encodeServerMessage,
   type ServerMessage,
 } from "./protocol.ts";
-import type { PermissionWatcher } from "./opencode/permissions.ts";
 import { Router } from "./router/router.ts";
 import { SttClient } from "./stt/groq.ts";
 import { PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine } from "./tts/kokoro.ts";
 import { TurnManager } from "./turn.ts";
+import { ClientWorkspaces, type WorkspaceRegistry } from "./workspace.ts";
 
 const SERVER_ID = "yammer-server/0.1.0";
 
@@ -38,9 +37,9 @@ const HANDSHAKE_TIMEOUT_MS = 5_000;
 export interface Deps {
   stt: SttClient;
   router: Router;
-  opencode: OpenCodeSession;
+  /** Every project Yammer can work on. Each carries its own OpenCode. */
+  workspaces: WorkspaceRegistry;
   tts: TtsEngine;
-  permissions: PermissionWatcher;
 }
 
 export function startServer(config: Config, deps: Deps): WebSocketServer {
@@ -95,34 +94,17 @@ function handleConnection(
     },
   };
 
-  const supervisor = new PermissionSupervisor(
-    sink,
-    deps.permissions,
-    deps.stt,
-    deps.tts,
-    config.supervisor,
-    () => deps.opencode.abort(),
-  );
+  const supervisor = new PermissionSupervisor(sink, deps.stt, deps.tts, config.supervisor);
 
-  const turns = new TurnManager(
-    sink,
-    deps.stt,
-    deps.router,
-    deps.opencode,
-    deps.tts,
-    supervisor,
-  );
+  // This client's own view of the workspaces: which one it is in, and its
+  // conversation in each. Permissions reach the turn manager through it —
+  // each session it opens claims its own routing entry on the workspace, which
+  // is what makes "another client's prompt" and "our prompt" distinguishable
+  // on a stream that carries both.
+  const client = new ClientWorkspaces(deps.workspaces);
 
-  // Permissions are published globally by OpenCode, so filter to the session
-  // this server actually drives — another OpenCode client's prompts are not
-  // ours to answer.
-  deps.permissions.onAsked((request) => {
-    if (request.sessionID !== deps.opencode.currentSessionId) {
-      log.debug("ignoring permission for another session", { id: request.id });
-      return;
-    }
-    turns.handlePermission(request);
-  });
+  const turns = new TurnManager(sink, deps.stt, deps.router, client, deps.tts, supervisor);
+  client.attach(turns);
 
   const handshakeTimer = setTimeout(() => {
     if (!authenticated) {
@@ -212,6 +194,9 @@ function handleConnection(
     clearTimeout(handshakeTimer);
     // Disconnection abandons the in-flight turn — there is no resumption.
     turns.abandon();
+    // And stops us claiming permissions for conversations nobody can hear. The
+    // sessions themselves survive on OpenCode; it is only the routing that goes.
+    client.release();
     onClose();
     log.info("client disconnected", { peer, code, reason: reason.toString() });
   });

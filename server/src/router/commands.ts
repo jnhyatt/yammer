@@ -9,7 +9,7 @@
  * The v1 set is a starting point, not an exhaustive list.
  */
 
-import type { SessionController } from "../opencode/session.ts";
+import type { SessionController } from "../workspace.ts";
 
 export interface MetaCommand {
   /** Stable identifier. Becomes a value in the router's `action` enum. */

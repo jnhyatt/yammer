@@ -9,7 +9,10 @@
  * overriding anything already set — see `env.ts`.
  */
 
+import { join } from "node:path";
+
 import { loadEnvFile } from "./env.ts";
+import { defaultStateDir } from "./registry/store.ts";
 
 export interface Config {
   /** Interface to bind. Defaults to loopback — see PROTOCOL.md on scoping. */
@@ -45,6 +48,25 @@ export interface Config {
      * which formats for a screen and reads badly aloud.
      */
     agent: string;
+  };
+
+  /** Durable state Yammer keeps across its own restarts. */
+  state: {
+    /**
+     * Directory holding the workspace registry. Defaults to the platform's
+     * application data directory (`~/.local/share/yammer` on Linux); overriding
+     * it is mostly for running two Yammers against separate state.
+     */
+    dir: string;
+  };
+
+  container: {
+    /**
+     * Podman's REST socket. Yammer runs as the user, so this is the user's own
+     * rootless socket — enable it with `systemctl --user enable --now
+     * podman.socket` if reconciliation reports it unreachable.
+     */
+    socketPath: string;
   };
 
   supervisor: {
@@ -127,6 +149,18 @@ function oneOf<const T extends readonly string[]>(
   return raw as T[number];
 }
 
+/**
+ * Podman's rootless socket for this user.
+ *
+ * `XDG_RUNTIME_DIR` is what systemd sets and what Podman itself honours; the
+ * `/run/user/<uid>` form is the same path reconstructed for the cases where it
+ * isn't set (a bare `su`, a cron job).
+ */
+function defaultPodmanSocket(): string {
+  const runtimeDir = process.env["XDG_RUNTIME_DIR"] || `/run/user/${process.getuid?.() ?? 1000}`;
+  return join(runtimeDir, "podman", "podman.sock");
+}
+
 export function loadConfig(): Config {
   // Before any read of process.env below, and non-overriding, so an explicit
   // `FOO=bar npm start` still beats the file.
@@ -156,6 +190,14 @@ export function loadConfig(): Config {
       providerId: process.env["YAMMER_OPENCODE_PROVIDER"] || undefined,
       modelId: process.env["YAMMER_OPENCODE_MODEL"] || undefined,
       agent: optional("YAMMER_OPENCODE_AGENT", "yammer"),
+    },
+
+    state: {
+      dir: optional("YAMMER_STATE_DIR", defaultStateDir()),
+    },
+
+    container: {
+      socketPath: optional("YAMMER_PODMAN_SOCKET", defaultPodmanSocket()),
     },
 
     supervisor: {

@@ -47,6 +47,8 @@ containers/            Containerfiles for the server and OpenCode images
 quadlet/               Podman Quadlet units to run both as systemd services — see quadlet/README.md
 voice-opencode-requirements.md   scope and design decisions
 android-client-plan.md           the Android client's implementation plan (§9 of the above)
+yammer-server-v2.md              per-project OpenCode containers: scope and design decisions
+yammer-server-v2-plan.md         how and in what order that gets built, and how far it has got
 ```
 
 Each half has a gitignored `.env` and a checked-in `.env.example`. `YAMMER_TOKEN`
@@ -88,7 +90,7 @@ Config comes from the environment, with a `.env` loaded at startup — first fil
 found wins, files are never merged, and the real environment always beats the
 file. Both READMEs document the search order.
 
-`npm test` (server) runs three suites. What they have in common is that all three
+`npm test` (server) runs five suites. What they have in common is that all five
 guard failures that are **silent** — everything else here fails loudly, since a
 bad model id 404s and a protocol mismatch closes the socket.
 
@@ -102,6 +104,13 @@ bad model id 404s and a protocol mismatch closes the socket.
   Its load-bearing assertion is the invariant below: **every turn exit path
   emits `turn.end`.** A path that skips it strands the client with no way back
   to idle.
+- `registry/store.test.ts` — the workspace registry's parser. A file edited by
+  hand into something slightly wrong must fail at startup naming the field; a
+  parser that shrugs drops a workspace out of `list` while its directory, and
+  the user's work in it, sit there untouched.
+- `registry/reconcile.test.ts` — registry vs. the containers that actually
+  exist. A workspace reported `ready` whose container was removed weeks ago
+  sends the next `load` into a timeout with no explanation.
 
 **One thing is still worth promoting into a checked-in test**: the `.env` parser
 parity check. `client/.../env.py` hand-implements Node's `process.loadEnvFile`
@@ -221,7 +230,7 @@ Notes here should be things that cost someone time.
   is not `POST /session/{id}/prompt`.** Two things that will each waste an hour
   when touching the agent. Config-time files — `.opencode/agent/*.md`,
   `opencode.json`, skills, plugins — are read once when `opencode serve` boots,
-  so an edited agent means nothing until it restarts; `OpenCodeSession.verifyAgent()`
+  so an edited agent means nothing until it restarts; `OpenCodeClient.verifyAgent()`
   exists to turn that into a startup warning instead of a mystery. And when
   poking the API by hand, `session.prompt()` posts to `/session/{id}/message`
   (`prompt_async` is the one at a `/prompt`-shaped path) — the wrong path returns
@@ -264,13 +273,23 @@ Notes here should be things that cost someone time.
   interruption one sentence long. `play()` slices to 40 ms on the way in for
   exactly this reason — `flush()` on its own does nothing about audio already
   being written.
+- **Node's `fetch` cannot talk to a Unix socket,** which is how Podman's REST
+  API is reached. There is no option for it on the global `fetch` and undici's
+  is behind a custom dispatcher, so `src/container/podman.ts` uses `node:http`
+  with `socketPath` instead. The URL still needs a host the parser accepts even
+  though the transport ignores it. Also worth knowing before poking at it by
+  hand: `podman ps` and the API disagree about defaults — the API returns only
+  running containers unless you pass `all=true`, so a stopped workspace looks
+  removed rather than stopped. Verify shapes against the live socket:
+  `curl -s --unix-socket $XDG_RUNTIME_DIR/podman/podman.sock
+  'http://d/v5.0.0/libpod/containers/json?all=true'`.
 - **OpenCode's own default model is not guaranteed to work, and the failure
-  only shows up on the first forwarded turn.** `OpenCodeSession.resolveModel`
+  only shows up on the first forwarded turn.** `OpenCodeClient.resolveModel`
   falls back to `client.config.providers()`'s first default when
   `YAMMER_OPENCODE_PROVIDER`/`YAMMER_OPENCODE_MODEL` are unset — that default
   has pointed at a model the account can't actually use. Set both explicitly.
   `opencode/deepseek-v4-flash-free` is verified working end to end (real
-  `OpenCodeSession.prompt()` call, real reply) with no extra credentials and no
+  `OpenCodeClient.prompt()` call, real reply) with no extra credentials and no
   cost. The adjacent-looking `opencode-go`'s paid `deepseek-v4-flash` is a trap
   — same model family, cheap, but **region-locked to China**, 403s "requires
   explicit opt in" on first use. See server/README.md's "OpenCode model"
