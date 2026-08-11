@@ -1,0 +1,5 @@
+[Unit]
+Description=Private network joining the Yammer server and OpenCode containers
+
+[Network]
+NetworkName=yammer

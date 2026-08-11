@@ -1,0 +1,26 @@
+[project]
+name = "yammer-client"
+version = "0.1.0"
+description = "Yammer client: wake-word detection, audio capture, earcons, and playback."
+readme = "README.md"
+# Pinned to 3.11: openwakeword declares an unconditional tflite-runtime
+# dependency on Linux, and tflite-runtime publishes no wheels past cp311. We run
+# ONNX inference, not tflite, but the dependency is still resolved. Revisit if
+# openwakeword ever makes the tflite backend optional.
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "openwakeword>=0.6.0",
+    "sounddevice>=0.5.0",
+    "numpy>=1.26,<3",
+    "websockets>=13.0",
+]
+
+[project.scripts]
+yammer-client = "yammer_client.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yammer_client"]

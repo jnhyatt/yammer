@@ -1,0 +1,47 @@
+[Unit]
+Description=Yammer server (STT, routing, OpenCode client, TTS)
+After=yammer-opencode.service
+Wants=yammer-opencode.service
+
+[Container]
+Image=yammer-server.build
+ContainerName=yammer-server
+Network=yammer.network
+
+# Secrets and tuning knobs live in the real .env (gitignored) and are read as
+# systemd's EnvironmentFile= — not Node's parser, so quoting with backticks
+# (server/README.md mentions this as supported) won't work here even though
+# it works under `npm start`. Not an issue for the current file, which has no
+# quoted values, but worth knowing before adding one.
+EnvironmentFile=%h/yammer/server/.env
+
+# These three override whatever's in .env — Podman's own env precedence puts
+# --env above --env-file unconditionally (podman-run(1)'s ENVIRONMENT
+# section), regardless of the order Quadlet emits the flags in — because
+# they're topology facts about this container deployment, not secrets:
+#   - the app should bind every interface *inside its own network namespace*;
+#     PublishPort below is what actually controls host-facing exposure, so
+#     this isn't the "never 0.0.0.0" case server/README.md warns about.
+#   - yammer-opencode isn't reachable at 127.0.0.1 from a sibling container;
+#     it's reachable by container name over the yammer network.
+#   - /workspace is where yammer-opencode.container mounts the repo, not
+#     wherever .env's YAMMER_PROJECT_DIR happens to point on the host.
+Environment=YAMMER_HOST=0.0.0.0
+Environment=YAMMER_OPENCODE_URL=http://yammer-opencode:4096
+Environment=YAMMER_PROJECT_DIR=/workspace
+
+# Bind to loopback by default — matches server/README.md's "never 0.0.0.0"
+# guidance for the client-facing socket. Change the host IP to a Tailscale
+# address to reach it from another machine.
+PublishPort=127.0.0.1:8765:8765
+
+# Kokoro's weights (~90 MB) download on first run into this path inside the
+# image (see @huggingface/transformers' default cache resolution). A named
+# volume here means a container recreate doesn't pay that cold start again.
+Volume=yammer-tts-cache:/app/node_modules/@huggingface/transformers/.cache
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

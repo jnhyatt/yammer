@@ -1,0 +1,27 @@
+{
+  "name": "yammer-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Yammer server: STT, routing, OpenCode, and TTS behind a WebSocket.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
+    "eval:router": "node --experimental-strip-types src/router/eval/run.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.0",
+    "kokoro-js": "^1.2.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  }
+}

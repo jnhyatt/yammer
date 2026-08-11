@@ -1,0 +1,10 @@
+# Arch base to match how opencode is installed on the host this was built for
+# (pacman, not npm/curl) — same package, same version, no separate install
+# path to keep in sync.
+FROM docker.io/library/archlinux:latest
+
+RUN pacman -Syu --noconfirm --needed opencode git \
+    && pacman -Scc --noconfirm
+
+EXPOSE 4096
+ENTRYPOINT ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
