@@ -559,6 +559,17 @@ def main() -> int:
                 "  .venv/bin/python -c 'import openwakeword.utils as u; u.download_models()'"
             )
 
+    # Recorded in the fixture so a port can prove it loaded the same weights.
+    # Every number below is a function of these five files; a port checked
+    # against a differently-versioned model would fail with numeric noise and no
+    # indication of why.
+    model_files = {
+        "melspectrogram": model_dir / "melspectrogram.onnx",
+        "embedding": model_dir / "embedding_model.onnx",
+        "vad": model_dir / "silero_vad.onnx",
+        **wake_models,
+    }
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     wav_path = args.out_dir / "input.wav"
     if args.input:
@@ -652,6 +663,13 @@ def main() -> int:
             "warmupFrames": WARMUP_FRAMES,
             "featureSeed": "silence",
             "featureSeedSamples": SEED_SAMPLES,
+        },
+        "models": {
+            role: {
+                "file": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for role, path in model_files.items()
         },
         "shapes": {
             "melWindowFrames": MEL_WINDOW_FRAMES,
