@@ -1,9 +1,10 @@
 # Yammer — Android Client Implementation Plan
 
-> **Status: Phase 0 complete, no Android code yet.** Written 2026-08-11 after a
-> feasibility dig through `client/` and openWakeWord's internals; Phase 0
-> executed the same day. Supersedes the "Mobile client" entry on the
-> requirements doc's non-goals list, now amended as §9 — see
+> **Status: Phases 0 and 1 complete.** The feature pipeline exists in Kotlin and
+> reproduces the golden vectors; there is no Android *app* yet. Written
+> 2026-08-11 after a feasibility dig through `client/` and openWakeWord's
+> internals; Phases 0 and 1 executed the same day. Supersedes the "Mobile client"
+> entry on the requirements doc's non-goals list, now amended as §9 — see
 > [Doc changes](#doc-changes-required).
 
 ## Verdict
@@ -15,15 +16,21 @@ phone's big core beats that. Silero VAD adds 0.96 ms (1.2%). All five models are
 plain ONNX totalling 6.2 MB and run on `onnxruntime-android` unmodified: no
 conversion, no quantization, no NNAPI or GPU delegate.
 
-The real work is a **faithful Kotlin port of openWakeWord's streaming feature
+The real work was a **faithful Kotlin port of openWakeWord's streaming feature
 pipeline** — roughly 400 lines of fiddly but fully deterministic buffer
-arithmetic. Phase 0 has since pinned it to golden vectors, and a from-scratch
-reimplementation built only from this document's description reproduced the
-library **exactly** (`0.0` divergence over 48 blocks). What was the plan's
-largest unknown is now a fixture to code against.
+arithmetic. Phase 0 pinned it to golden vectors, with a from-scratch
+reimplementation built only from this document's description reproducing the
+library **exactly** (`0.0` divergence over 48 blocks). Phase 1 then wrote the
+Kotlin against that fixture, and it agrees to **4.999e-07 — the fixture's own
+six-decimal rounding step**, which is as exactly as the fixture can measure.
+
+What was the plan's largest unknown is now finished and tested, and it took
+about a day rather than the estimated three. The remaining work is ordinary
+Android application code.
 
 Total: **~1,600 lines of Kotlin**, ~2–3 weeks of focused part-time work, with an
-open-ended tuning tail.
+open-ended tuning tail. Phase 1 came in at 812 lines of pipeline and 909 of
+test, which suggests the estimate was about right for the parts that remain.
 
 ## Locked scope decisions
 
@@ -51,11 +58,21 @@ android/
   README.md                     requirements, build, config, the LE Audio caveat
   settings.gradle.kts
   build.gradle.kts
-  app/
+  gradle/libs.versions.toml
+  models/                       the five .onnx files, 6.1 MB   ✅
+  core/                         pure Kotlin/JVM — no Android dependencies  ✅
+    src/main/kotlin/dev/yammer/core/
+      AudioFeatures.kt          ← openwakeword/utils.py  (the real work)
+      WakeWordModel.kt          ← openwakeword/model.py
+      SileroVad.kt              ← openwakeword/vad.py
+      WakeWordDetector.kt       ← client/src/yammer_client/wakeword.py
+      SpeechGate.kt             ← client/src/yammer_client/vad.py
+      Onnx.kt                   model loading and tensor plumbing
+    src/test/kotlin/            golden-vector tests — desktop JVM, no emulator
+  app/                          (Phase 2)
     build.gradle.kts
     src/main/
       AndroidManifest.xml
-      assets/models/            the five .onnx files, 6.2 MB
       java/dev/yammer/android/
         MainActivity.kt         permission request, start/stop, log view
         YammerService.kt        foreground service, type=microphone
@@ -64,13 +81,24 @@ android/
         YammerClient.kt         ← client/src/yammer_client/app.py
         AudioIo.kt              ← client/src/yammer_client/audio.py
         Earcons.kt              ← client/src/yammer_client/earcons.py
-        WakeWordDetector.kt     ← client/src/yammer_client/wakeword.py
-        SpeechGate.kt           ← client/src/yammer_client/vad.py
-        AudioFeatures.kt        ← openwakeword/utils.py  (NEW — the real work)
-        WakeWordModel.kt        ← openwakeword/model.py  (NEW)
-        SileroVad.kt            ← openwakeword/vad.py    (NEW)
-    test/                       JVM unit tests — golden vectors, no emulator
 ```
+
+**Amended in Phase 1: the pipeline is its own Kotlin/JVM module, not part of the
+app.** Two reasons, both found by doing it. The pipeline has no Android
+dependencies, so a plain JVM module keeps its tests off the Android toolchain
+entirely — `./gradlew :core:test` needs no SDK, no emulator and no device, and
+runs in about twenty seconds. And ONNX Runtime ships two artifacts with the same
+`ai.onnxruntime` API: the AAR for the device and the jar for the desktop. In a
+single module both land on the unit-test classpath, where the AAR — which
+carries no desktop native library — can win the ordering and fail every test
+with an `UnsatisfiedLinkError` that looks nothing like its cause. `compileOnly`
+in `core`, with each consumer supplying its own runtime, makes that a
+non-question rather than a thing to debug later.
+
+`models/` is likewise one directory rather than a copy under `app/src/main/
+assets/`: the app module will add it as an extra asset source. The fixture
+records each file's SHA-256, so the tests fail loudly if these are not the exact
+weights the golden vectors were generated from.
 
 **The left-hand column is load-bearing.** `protocol/PROTOCOL.md`,
 `server/src/protocol.ts`, and `client/.../protocol.py` are already three views of
@@ -203,26 +231,49 @@ non-goals.
 **Done when:** ✅ the fixture exists and is exact, ✅ the doc is accurate,
 ✅ `npm test` runs the conformance check, ✅ the non-goal is amended openly.
 
-### Phase 1 — Feature pipeline in Kotlin (~3–4 days)
+### Phase 1 — Feature pipeline in Kotlin ✅
 
 `AudioFeatures.kt`, `WakeWordModel.kt`, `SileroVad.kt`, `WakeWordDetector.kt`,
-`SpeechGate.kt`. Written as **pure Kotlin with no Android dependencies**, so it
-runs under plain JVM unit tests against the desktop ORT artifact — fast
-iteration, no emulator, no device.
+`SpeechGate.kt` and `Onnx.kt`, in `android/core` — **pure Kotlin with no Android
+dependencies**, under plain JVM unit tests against the desktop ORT artifact.
 
-Work bottom-up against the fixture, in the order the probes are laid out:
-melspectrogram probe → embedding probe → classifier probe → gating trace →
-per-block streaming records. Each stage fails independently, so a divergence
-localizes itself instead of presenting as "the score is wrong".
+**39 tests, all passing.** The pipeline reproduces
+`fixtures/wakeword/golden.json` end to end, and the worst disagreement anywhere —
+mel frames, embeddings, classifier scores, VAD probabilities, buffer depths —
+is **4.999e-07**:
 
-Two things the fixture pins that are easy to get wrong and give no other signal:
-seed the feature buffer with **four seconds of silence** (openWakeWord uses
-random audio, which is not reproducible), and remember the classifiers' ONNX
-input names differ between models (`x.1` for `hey_jarvis`, `onnx::Flatten_0` for
-`alexa`) — read `session.inputNames.first()` rather than hardcoding either.
+> The fixture rounds to six decimals, which is an absolute error of at most
+> 5e-7. The observed worst case *is* that rounding step. Both sides run ONNX
+> Runtime 1.28.0 against the same weights, so the tolerance is 1e-6 and there is
+> no per-platform slack; the two implementations agree as exactly as the fixture
+> is capable of recording.
 
-**Done when:** JVM tests reproduce `fixtures/wakeword/golden.json` within f32
-tolerance, end to end from PCM to classifier score.
+Built bottom-up against the probes, which is what made this a day rather than
+three: melspectrogram → embedding → classifier → gating trace → per-block
+streaming. Every stage that broke, broke on its own test.
+
+Three things beyond the numeric port:
+
+- **The fixture now records model digests.** Every value in it is a function of
+  five `.onnx` files, and a port checked against differently-versioned weights
+  would have failed as unexplained numeric noise. `make_golden_vectors.py`
+  writes their SHA-256s; `ModelIdentityTest` verifies the checked-in copies
+  before any comparison runs. (Regenerating with the addition still cross-checks
+  against the library at `0.0`, and is still byte-deterministic.)
+- **`reset()` is now cheap** — see the amended gotcha below.
+- **Model loading goes through a `ModelSource`** that hands ONNX Runtime a byte
+  array, because that is the only route available on both sides: assets on the
+  phone have no filesystem path at all. The desktop-only `createSession(String)`
+  overload is the mistake that compiles and then fails on device.
+
+Two details the fixture pinned that were easy to get wrong and gave no other
+signal, both confirmed in the port: seed the feature buffer with **four seconds
+of silence** (openWakeWord uses random audio, which is not reproducible), and
+the classifiers' ONNX input names differ between models (`x.1` for `hey_jarvis`,
+`onnx::Flatten_0` for `alexa`) — read `session.inputNames.first()`.
+
+**Done when:** ✅ JVM tests reproduce `fixtures/wakeword/golden.json` end to end,
+from PCM to classifier score.
 
 ### Phase 2 — Audio I/O and earcons (~2 days)
 
@@ -277,7 +328,7 @@ The part that cannot be done by reading code:
 
 | Layer | How |
 |---|---|
-| Feature pipeline | JVM unit tests vs. Phase 0 golden vectors. The one place where a subtle bug is silent — a wrong buffer offset yields scores that look reasonable and never fire. |
+| Feature pipeline | ✅ `./gradlew :core:test` — 39 JVM tests vs. the Phase 0 golden vectors, worst divergence 4.999e-07. The one place where a subtle bug is silent: a wrong buffer offset yields scores that look reasonable and never fire. |
 | Protocol | The Phase 0 conformance check, driven against `Protocol.kt`. |
 | Earcons | By ear. They are the only status channel; there is no better test. |
 | Wake-word accuracy | By use. Log every score above ~0.3 so false-negative complaints are diagnosable after the fact. |
@@ -294,16 +345,19 @@ The part that cannot be done by reading code:
 
 ### Two gotchas that will otherwise cost an hour each
 
-- **`reset()` is expensive: 86 ms measured on desktop,** and it reseeds the
-  feature buffer with 4 s of random audio, which re-triggers the 5-frame warmup —
-  so there is a **~400 ms deaf window** after every reset. `app.py` calls it at
-  every `turn.end` and every `_leave_answering()`. On desktop it hides under the
-  stop-record earcon. On a phone it could be 150–400 ms of compute and **must not
-  run on the audio callback thread**. openWakeWord's own docstring warns it "may
-  not be efficient when called too frequently."
-- **ONNX Runtime cannot load a model from an asset path.** Read the asset into a
-  `ByteArray` and use the byte-array session constructor, or copy to `filesDir`
-  on first run.
+- ~~**`reset()` is expensive: 86 ms measured on desktop**~~ — **fixed in Phase 1,
+  but only half of it.** The library reseeds the feature buffer with 4 s of fresh
+  random audio on every reset: one melspectrogram over 64000 samples plus a
+  41-window embedding batch. The port seeds with *silence*, which is constant, so
+  `AudioFeatures` computes that once at construction and copies it back — the
+  compute is gone. **The ~400 ms deaf window is not.** Clearing the prediction
+  buffer re-triggers the 5-frame warmup by design, and `app.py` calls `reset()`
+  at every `turn.end` and every `_leave_answering()`. On desktop it hides under
+  the stop-record earcon; the same has to hold on the phone.
+- ~~**ONNX Runtime cannot load a model from an asset path.**~~ Handled in Phase 1
+  by `ModelSource`, which hands the runtime a `ByteArray` on both the desktop and
+  the device. Still worth knowing, because the `createSession(String)` overload
+  compiles fine and fails only on hardware.
 
 ## Doc changes required
 
@@ -325,11 +379,17 @@ prevent. This project takes an entry off that list, so the doc changes first.
   headphones operating assumption gains a note that Android gets AEC as a side
   effect of declaring a communication capture use case. Deferred to Phase 2
   deliberately: both are claims about a thing that does not yet run.
-- ⬜ **`AGENTS.md`, second pass** — add `android/` to the layout, the `reset()`
-  cost and ONNX-asset-loading gotchas, and the note that the protocol contract
-  has four views rather than three. Due when `Protocol.kt` exists (Phase 3).
-- ⬜ **`android/README.md`** — new. Requirements (including the YMMV hardware
-  caveat), build, config table, earcon table.
+- ◐ **`AGENTS.md`, second pass** — done: `android/`, `android/core/` and
+  `android/models/` are in the layout, `./gradlew :core:test` is in the commands,
+  and the test section describes what that suite guards. Still outstanding: the
+  note that the protocol contract has four views rather than three, due when
+  `Protocol.kt` exists (Phase 3). The `reset()` and asset-loading gotchas turned
+  out not to belong there — both are now solved in code rather than warned about
+  in prose.
+- ◐ **`android/README.md`** — written: requirements including the YMMV hardware
+  caveat, the module split and why, build and test, the model table and what the
+  suite actually checks. The config and earcon tables follow the code that needs
+  them (Phases 4 and 2).
 
 ## Non-goals
 

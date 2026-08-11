@@ -46,11 +46,28 @@ against.
   every score in `blocks[]` sits near zero and a port whose classifier always
   returned `0.0` would match them. The classifier probe lands at 0.63 and 0.97,
   above both thresholds, so it exercises the detection path too.
+- **`models`** — the SHA-256 of each of the five `.onnx` files the numbers were
+  generated from. Every value here is a function of those weights, so a port
+  checked against a differently-versioned model would fail as numeric noise with
+  nothing pointing at the cause. `ModelIdentityTest` verifies the copies in
+  `android/models/` against these digests before any comparison runs.
 - **`probes.gating`** — a scripted score sequence through the warmup and
   refractory logic: five zeroed warmup frames, a fire, two suppressed frames
   inside the refractory window, and a re-arm once it clears. The audio fixture
   gives no coverage here at all, and this is where the port is most likely to go
   subtly wrong.
+
+### Who checks against it
+
+[`android/core`](../android/core) — the Kotlin feature pipeline, under plain JVM
+unit tests (`cd android && ./gradlew :core:test`). It runs the same ONNX Runtime
+version the generator did, against the same weights, so the tests allow no
+tolerance beyond the fixture's own six-decimal rounding: 1e-6.
+
+The worst disagreement observed across every comparison — mel frames,
+embeddings, classifier scores, VAD probabilities — is **4.999e-07**, which *is*
+the rounding half-step. The two implementations agree as exactly as this file is
+capable of recording.
 
 ### Determinism
 
