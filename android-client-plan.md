@@ -1,11 +1,18 @@
 # Yammer — Android Client Implementation Plan
 
-> **Status: Phases 0 and 1 complete.** The feature pipeline exists in Kotlin and
-> reproduces the golden vectors; there is no Android *app* yet. Written
-> 2026-08-11 after a feasibility dig through `client/` and openWakeWord's
-> internals; Phases 0 and 1 executed the same day. Supersedes the "Mobile client"
-> entry on the requirements doc's non-goals list, now amended as §9 — see
-> [Doc changes](#doc-changes-required).
+> **Status: Phases 0, 1 and 2 complete.** The feature pipeline and the earcons
+> exist in Kotlin and reproduce their golden vectors; there is an APK that plays
+> the earcons and records a WAV, but no client yet — nothing speaks the protocol.
+> Written 2026-08-11 after a feasibility dig through `client/` and openWakeWord's
+> internals; Phases 0 and 1 executed the same day, Phase 2 on 2026-08-12.
+> Supersedes the "Mobile client" entry on the requirements doc's non-goals list,
+> now amended as §9 — see [Doc changes](#doc-changes-required).
+>
+> **Phase 2's done-when is half machine-checkable and half not.** The earcon
+> arithmetic is pinned to a fixture and agrees with Python *exactly*; whether the
+> five are audible and distinguishable through the target earbuds is a judgement
+> that needs the earbuds. The APK exists to make that judgement, and to answer
+> the capture-bandwidth question with a measurement rather than an opinion.
 
 ## Verdict
 
@@ -68,20 +75,30 @@ android/
       WakeWordDetector.kt       ← client/src/yammer_client/wakeword.py
       SpeechGate.kt             ← client/src/yammer_client/vad.py
       Onnx.kt                   model loading and tensor plumbing
+      Earcons.kt                ← client/src/yammer_client/earcons.py   ✅
+      Wav.kt                    RIFF read/write, for getting captures off the phone  ✅
     src/test/kotlin/            golden-vector tests — desktop JVM, no emulator
-  app/                          (Phase 2)
+  app/                          ✅ Phase 2
     build.gradle.kts
     src/main/
       AndroidManifest.xml
-      java/dev/yammer/android/
-        MainActivity.kt         permission request, start/stop, log view
-        YammerService.kt        foreground service, type=microphone
-        Config.kt               ← client/src/yammer_client/config.py
-        Protocol.kt             ← client/src/yammer_client/protocol.py
-        YammerClient.kt         ← client/src/yammer_client/app.py
-        AudioIo.kt              ← client/src/yammer_client/audio.py
-        Earcons.kt              ← client/src/yammer_client/earcons.py
+      res/values/strings.xml
+      kotlin/dev/yammer/android/
+        AudioIo.kt              ← client/src/yammer_client/audio.py     ✅
+        AudioCheckActivity.kt   the audio harness, and a permanent diagnostic  ✅
+        MainActivity.kt         (Phase 4) permission request, start/stop, log view
+        YammerService.kt        (Phase 4) foreground service, type=microphone
+        Config.kt               (Phase 4) ← client/src/yammer_client/config.py
+        Protocol.kt             (Phase 3) ← client/src/yammer_client/protocol.py
+        YammerClient.kt         (Phase 3) ← client/src/yammer_client/app.py
+  tools/
+    check_capture.py            spectrum verdict on a pulled WAV  ✅
 ```
+
+**Amended in Phase 2: `Earcons.kt` moved to `core`**, for Phase 1's reason — it
+is pure arithmetic, and in `core` it is checked against a fixture instead of by
+ear. `Wav.kt` joined it, unplanned, because the done-when needs a WAV off the
+phone. `app` is where Android is, and nothing else.
 
 **Amended in Phase 1: the pipeline is its own Kotlin/JVM module, not part of the
 app.** Two reasons, both found by doing it. The pipeline has no Android
@@ -107,13 +124,18 @@ a protocol change has an obvious checklist.
 
 ### Dependencies
 
-- `com.microsoft.onnxruntime:onnxruntime-android` — inference
+- `com.microsoft.onnxruntime:onnxruntime-android` — inference. **Phase 4**: it is
+  28 MB of arm64 native library, and nothing before then calls it.
 - `com.microsoft.onnxruntime:onnxruntime` (JVM, `testImplementation` only) — lets
   the feature-pipeline tests run as plain JVM unit tests against the same models
-- `com.squareup.okhttp3:okhttp` — WebSocket
-- `org.jetbrains.kotlinx:kotlinx-serialization-json` — control frames
-- `androidx.datastore:datastore-preferences` — config
-- Compose for the (deliberately minimal) UI
+- `org.jetbrains.kotlinx:kotlinx-coroutines-android` — capture is a `Flow`
+- `com.squareup.okhttp3:okhttp` — WebSocket (Phase 3)
+- `org.jetbrains.kotlinx:kotlinx-serialization-json` — control frames (Phase 3)
+- `androidx.datastore:datastore-preferences` — config (Phase 4)
+- ~~Compose for the (deliberately minimal) UI~~ — **not in Phase 2.** The audio
+  harness is framework Views: a screen whose whole job is to tell you whether
+  audio works should not have a UI framework in it that could be why it doesn't.
+  Revisit at Phase 4, where the UI is an actual artifact rather than a diagnostic.
 
 ### Permissions
 
@@ -275,7 +297,7 @@ the classifiers' ONNX input names differ between models (`x.1` for `hey_jarvis`,
 **Done when:** ✅ JVM tests reproduce `fixtures/wakeword/golden.json` end to end,
 from PCM to classifier score.
 
-### Phase 2 — Audio I/O and earcons (~2 days)
+### Phase 2 — Audio I/O and earcons (~2 days) ✅
 
 `AudioIo.kt`, `Earcons.kt`. `AudioRecord` at 16 kHz mono PCM16 in 1280-sample
 blocks; `AudioTrack` at the rate the server declares in `hello.ok`.
@@ -289,6 +311,80 @@ Two things get *simpler* than the Python client here:
 
 **Done when:** all five earcons are audible and distinguishable through the
 target earbuds, and a captured 10 s WAV round-trips at full bandwidth.
+
+#### What was built
+
+> **The earcons are byte-identical to the Python client's.** All 75,697 samples,
+> five earcons across three rates, zero differing. The comparison allows ±1 LSB —
+> both sides truncate toward zero into int16, so a value within a float ulp of an
+> integer boundary may legitimately land either side — and that headroom went
+> entirely unused.
+
+Exactness here was not a given, and getting it needed the narrowing points to
+match rather than just the formulas. numpy computes the whole chain in float32:
+`2π·freq` is narrowed *before* it multiplies the sample times, `np.linspace`
+computes at double precision and narrows at the end while assigning its final
+element to `stop` outright, and — the one that would have been invisible —
+`error`'s sweep accumulates its phase as a running float32 sum. Carrying that
+accumulator at double precision is more accurate and does not match.
+
+Four amendments, all found by building it:
+
+- **`Earcons.kt` is in `core`, not `app`.** Same reasoning as Phase 1's module
+  split: it is pure arithmetic, so putting it where the JVM tests are turns "do
+  the earcons match?" from a judgement by ear into 8 checked tests. Only
+  playback needs Android.
+- **`Wav.kt` too**, which the plan did not list at all. The done-when needs a WAV
+  off the phone, and having a reader as well as a writer costs nothing and gets
+  the writer a real test: it reads `fixtures/wakeword/input.wav`, which Python
+  wrote.
+- **The slicing workaround is *not* unnecessary** — the bullet above is half
+  right. `AudioTrack.flush()` does drop the device buffer, which is the part the
+  desktop client cannot do. But a `WRITE_BLOCKING` write cannot be abandoned, so
+  a whole sentence handed over in one call is a whole sentence that must finish
+  writing before the writer thread can notice it was flushed. 40 ms slices stay,
+  for a different reason than in Python. (`flush()` also only takes effect on a
+  paused track — hence a pause/flush/play sandwich, which needs confirming on a
+  device.)
+- **No Compose, and no ONNX Runtime in the APK yet.** The harness is
+  framework Views: a diagnostic screen should not have a UI framework in it that
+  could itself be why audio misbehaves, and Phase 4's status view is a different
+  artifact anyway. Deferring ONNX Runtime to Phase 4 — nothing in Phase 2 runs
+  inference — takes the APK from 38 MB to 9.4 MB, which matters when the phase is
+  a sideload-listen-adjust loop. Checked before deferring: dexing `core` with
+  unresolved `ai.onnxruntime` references produces no warnings in a debug build.
+
+`AudioCheckActivity` is what makes the ear half of the done-when possible: it
+plays each earcon at any of the three fixture rates, records 10 s to a WAV, and
+reports level statistics plus **the device the OS actually routed to**. The
+capture source is selectable across all four, because its effect cannot be
+predicted from the API and recording the same room from each is the only way to
+compare.
+
+The bandwidth half is deliberately not judged on the phone. An 8 kHz-limited
+stream resampled to 16 kHz sounds *fine*, so it takes a spectrum:
+`android/tools/check_capture.py` prints a band table and returns a verdict.
+Both of its verdicts are checked — it says FULL BANDWIDTH for
+`fixtures/wakeword/input.wav` and BAND-LIMITED, naming the 3406 Hz cliff, for a
+deliberately band-limited copy of it.
+
+One thing surfaced that the plan had not connected up. §9 of the requirements doc
+says the capture *use case* must be a communication one, because an LE Audio link
+in a media context runs unidirectional and the buds' microphones do not stream at
+all — capture falls back to the phone's own microphone without saying so. That
+points at `VOICE_COMMUNICATION`, which is exactly the source a wake word would
+rather not have: it brings AEC and noise suppression, and this plan's own risk
+table lists AGC pumping the noise floor as a false-positive risk. The default
+follows the requirements doc rather than quietly building against it, and **the
+first comparison to run on a device is `VOICE_COMMUNICATION` against
+`VOICE_RECOGNITION`, watching the routed device.** If the latter keeps
+`BLE_HEADSET`, §9's claim needs revisiting and the wake word gets the cleaner
+stream.
+
+**Still open, and only a device can close it:** that comparison, whether the
+earbuds route `TYPE_BLE_HEADSET` rather than `TYPE_BLUETOOTH_SCO`, whether the
+five earcons are distinguishable in the ear, what the barge-in flush actually
+sounds like, and the battery question below.
 
 ### Phase 3 — Protocol and state machine (~2–3 days)
 
@@ -328,17 +424,18 @@ The part that cannot be done by reading code:
 
 | Layer | How |
 |---|---|
-| Feature pipeline | ✅ `./gradlew :core:test` — 39 JVM tests vs. the Phase 0 golden vectors, worst divergence 4.999e-07. The one place where a subtle bug is silent: a wrong buffer offset yields scores that look reasonable and never fire. |
+| Feature pipeline | ✅ `./gradlew :core:test` — vs. the Phase 0 golden vectors, worst divergence 4.999e-07. The one place where a subtle bug is silent: a wrong buffer offset yields scores that look reasonable and never fire. |
 | Protocol | The Phase 0 conformance check, driven against `Protocol.kt`. |
-| Earcons | By ear. They are the only status channel; there is no better test. |
+| Earcons | ✅ Pinned to `fixtures/earcons/golden.json` — byte-identical to the Python client's, ±1 LSB allowed and unused. What a fixture cannot check is whether they are *distinguishable in the ear*, which is what `AudioCheckActivity` is for. |
+| Capture bandwidth | ✅ `android/tools/check_capture.py` on a WAV pulled from the phone. Not judgeable by ear: a band-limited stream sounds fine and has already lost what cannot be recovered. |
 | Wake-word accuracy | By use. Log every score above ~0.3 so false-negative complaints are diagnosable after the fact. |
 
 ## Risks
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| **Earbud battery.** Always-on listening means the LE Audio bidirectional stream is up *continuously*, not in call-length bursts. Buds carry ~50–70 mAh. Expect meaningfully shorter runtime than media playback, possibly half. | **High** — and not codeable-around | Measure early, in Phase 2, before building on the assumption. If it fails, the fallback is phone-mic-in / A2DP-out, which costs nothing in bandwidth but requires the phone to be out and near you. |
-| Capture silently routes to the built-in mic instead of the buds | Medium | **Log `AudioRecord.getRoutedDevice()` at capture start.** Three lines. Turns a suspicion into a fact on first run: `TYPE_BLE_HEADSET` means the assumption held, `TYPE_BUILTIN_MIC` means it did not and you know why. Same principle as `Config.env_file` being reported at startup. |
+| **Earbud battery.** Always-on listening means the LE Audio bidirectional stream is up *continuously*, not in call-length bursts. Buds carry ~50–70 mAh. Expect meaningfully shorter runtime than media playback, possibly half. | **High** — and not codeable-around | Measure early, before building on the assumption. **Still the top open risk**: Phase 2 built the thing that can measure it — leave `AudioCheckActivity` recording and watch the buds — but nothing has been measured yet. If it fails, the fallback is phone-mic-in / A2DP-out, which costs nothing in bandwidth but requires the phone to be out and near you. |
+| ~~Capture silently routes to the built-in mic instead of the buds~~ | ~~Medium~~ → **instrumented** | Done in Phase 2. `AudioCapture` reports `getRoutedDevice()` at capture start and `describeDevice()` names the transport rather than printing a constant: `BLE_HEADSET (LE Audio — the supported path)` vs `BLUETOOTH_SCO (classic telephony — band-limited)` vs `BUILTIN_MIC`. A suspicion becomes a fact on first run. The *verdict* on what happens is still unmeasured. |
 | ~~Feature-pipeline port is subtly wrong~~ | ~~Medium~~ → **Low** | Retired by Phase 0. The algorithm is pinned to a fixture that a from-scratch reimplementation reproduced *exactly* (`0.0` divergence), so a Kotlin bug now surfaces as a failing JVM test rather than as a wake word that mysteriously doesn't fire. |
 | AGC pumping the noise floor causes wake-word false positives | Medium | Threshold re-tuning in Phase 5. If it persists, `UNPROCESSED` is available where `PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED` reports true — at the cost of losing AEC. |
 | Phone battery from preventing deep sleep | Low–Medium | Measure. The cost is dominated by keeping the CPU out of deep sleep, not by the 4.6%-of-a-core inference. |
@@ -374,11 +471,13 @@ prevent. This project takes an entry off that list, so the doc changes first.
 - ✅ **`AGENTS.md`** — `fixtures/` and `client/tools/` added to the repository
   layout; the test section now describes three suites and the fixture-regeneration
   step after a protocol change.
-- ⬜ **`voice-opencode-requirements.md`, second pass** — "Client (v1 = desktop
-  app)" in § Architecture will describe two clients once one exists, and the
-  headphones operating assumption gains a note that Android gets AEC as a side
-  effect of declaring a communication capture use case. Deferred to Phase 2
-  deliberately: both are claims about a thing that does not yet run.
+- ◐ **`voice-opencode-requirements.md`, second pass** — done: the headphones
+  operating assumption now carries the note that Android gets AEC and NS as a
+  side effect of the communication capture use case §9 requires, and says that
+  is a side effect to measure rather than a reason to support speakers. Still
+  outstanding: "Client (v1 = desktop app)" in § Architecture describing two
+  clients, which waits for Phase 3 — after Phase 2 there is an APK that plays
+  earcons and records audio, not a second client.
 - ◐ **`AGENTS.md`, second pass** — done: `android/`, `android/core/` and
   `android/models/` are in the layout, `./gradlew :core:test` is in the commands,
   and the test section describes what that suite guards. Still outstanding: the

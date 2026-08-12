@@ -21,7 +21,7 @@ The client only operates within a specific project directory it's configured for
 
 These are choices, not incidental facts. Changing one invalidates parts of the design.
 
-- **The user is wearing headphones or an earbud.** v1 does no acoustic echo cancellation and does not gate the microphone during playback, so synthesized speech played through a speaker will be picked up by the microphone and can trigger the client's own wake words. The earbud is a hard dependency, not a convenience. Revisit if v1 proves this impractical in the actual use context.
+- **The user is wearing headphones or an earbud.** v1 does no acoustic echo cancellation and does not gate the microphone during playback, so synthesized speech played through a speaker will be picked up by the microphone and can trigger the client's own wake words. The earbud is a hard dependency, not a convenience. Revisit if v1 proves this impractical in the actual use context. On Android the picture is slightly different but the assumption is unchanged: because §9 requires a *communication* capture use case to bring up the LE Audio bidirectional link, that client gets platform echo cancellation and noise suppression whether or not it wants them. That is a side effect to be aware of — it may well be worth turning off for wake-word quality once measured — and not a licence to support speakers.
 - **One user, one project, one client at a time.** No multi-tenancy, no session sharing, no concurrent clients against the same server.
 - **The network between client and server is trusted-ish but not open.** See §2 for the minimum bar.
 

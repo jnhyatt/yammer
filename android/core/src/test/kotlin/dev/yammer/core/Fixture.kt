@@ -12,6 +12,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.util.Base64
 import kotlin.math.abs
 import kotlin.test.assertTrue
 
@@ -34,6 +35,20 @@ object Fixture {
     val golden: JsonObject =
         Json.parseToJsonElement(File(fixturesDir, "wakeword/golden.json").readText()).jsonObject
 
+    /** `fixtures/earcons/golden.json` — see `client/tools/make_earcon_vectors.py`. */
+    val earcons: JsonObject =
+        Json.parseToJsonElement(File(fixturesDir, "earcons/golden.json").readText()).jsonObject
+
+    /** The rates the earcon fixture was generated at, read from the fixture. */
+    val earconRates: List<Int> get() = earcons.arr("rates").ints().toList()
+
+    /** The `pcmBase64` of one earcon entry, as int16 samples. */
+    fun pcmOf(entry: JsonObject): ShortArray {
+        val bytes = Base64.getDecoder().decode(entry.str("pcmBase64"))
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        return ShortArray(buffer.remaining()).also { buffer.get(it) }
+    }
+
     val config: JsonObject get() = golden.obj("config")
     val probes: JsonObject get() = golden.obj("probes")
     val blocks: JsonArray get() = golden.arr("blocks")
@@ -54,7 +69,7 @@ object Fixture {
 
     /** `input.wav`, split into the 80 ms blocks the client captures. */
     val audioBlocks: List<ShortArray> by lazy {
-        val samples = readWav(File(fixturesDir, "wakeword/input.wav"))
+        val samples = Wav.read(File(fixturesDir, "wakeword/input.wav").readBytes()).pcm
         val expected = golden.obj("input").int("samples")
         check(samples.size == expected) { "input.wav has ${samples.size} samples, fixture says $expected" }
         (samples.indices step AudioFeatures.BLOCK_SAMPLES).map { at ->
@@ -72,27 +87,6 @@ object Fixture {
             .digest(file.readBytes())
             .joinToString("") { "%02x".format(it) }
 
-    /** Minimal RIFF reader: 16-bit mono PCM is all the fixture ever contains. */
-    private fun readWav(file: File): ShortArray {
-        val bytes = ByteBuffer.wrap(file.readBytes()).order(ByteOrder.LITTLE_ENDIAN)
-        check(bytes.int == RIFF && bytes.getInt(8) == WAVE) { "$file is not a RIFF/WAVE file" }
-        bytes.position(12)
-        while (bytes.remaining() >= 8) {
-            val id = bytes.int
-            val size = bytes.int
-            if (id == DATA) {
-                val samples = ShortArray(size / 2)
-                bytes.asShortBuffer().get(samples)
-                return samples
-            }
-            bytes.position(bytes.position() + size + (size and 1))
-        }
-        error("$file has no data chunk")
-    }
-
-    private val RIFF = 0x46464952 // "RIFF", little-endian
-    private val WAVE = 0x45564157 // "WAVE"
-    private val DATA = 0x61746164 // "data"
 }
 
 // -- JSON access ------------------------------------------------------------
@@ -108,6 +102,7 @@ fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.content.toInt
 fun JsonObject.dbl(key: String): Double = getValue(key).jsonPrimitive.double
 fun JsonObject.doubles(key: String): DoubleArray = arr(key).doubles()
 fun JsonArray.doubles(): DoubleArray = DoubleArray(size) { this[it].jsonPrimitive.double }
+fun JsonArray.ints(): IntArray = IntArray(size) { this[it].jsonPrimitive.content.toInt() }
 fun JsonArray.rows(): List<DoubleArray> = map { it.jsonArray.doubles() }
 
 // -- Comparison -------------------------------------------------------------
