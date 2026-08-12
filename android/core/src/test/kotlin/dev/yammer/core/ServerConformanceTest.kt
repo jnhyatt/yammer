@@ -37,9 +37,13 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 class ServerConformanceTest {
 
     /**
-     * One connection, two turns. The fake server asks for permission on its
-     * second prompt, so this is both paths without a side channel: an ordinary
-     * turn, then one that stops to ask.
+     * One connection, three turns. A connection starts in no workspace — v3's
+     * "Connection lifecycle" — so the first turn is always spent loading one;
+     * the fake server treats any connection's first utterance as exactly that,
+     * regardless of what audio it carries, the same way `ws-server.test.ts`'s
+     * `TestClient.enter()` does. The fake asks for permission on its second
+     * forwarded prompt, so the two turns after that are both paths without a
+     * side channel: an ordinary turn, then one that stops to ask.
      */
     @Test
     fun `a turn and a permission prompt round-trip through the real server`() = withServer { port ->
@@ -69,6 +73,17 @@ class ServerConformanceTest {
             // The server declares Kokoro's rate; the client must take it from
             // the frame rather than from its own default, even when they agree.
             assertEquals(AudioFormat("pcm_s16le", 24_000, 1), speaker.format)
+
+            // --- entering the one workspace the fake server registers ------
+            say(Wake.START)
+            repeat(20) { client.onCaptureBlock(block()) }
+            say(Wake.STOP)
+            await("the workspace to be entered", diagnose = log::all) {
+                client.state == YammerClient.State.IDLE
+            }
+            // Clears the "You're in test." reply and its earcons so the
+            // assertions below see only the turn they are actually about.
+            speaker.clear()
 
             // --- an ordinary turn ------------------------------------------
             say(Wake.START)
@@ -128,7 +143,7 @@ class ServerConformanceTest {
             await("the second turn.end", diagnose = log::all) {
                 client.state == YammerClient.State.IDLE
             }
-            assertEquals(2L, client.turn)
+            assertEquals(3L, client.turn)
         } finally {
             transport.close()
         }

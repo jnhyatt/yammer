@@ -55,7 +55,7 @@ class YammerClientTest {
         assertEquals(listOf("hello"), transport.types())
         val hello = transport.frame(0)
         assertEquals(TOKEN, hello.text("token"))
-        assertEquals(2, hello.number("proto")?.toInt())
+        assertEquals(PROTOCOL_VERSION, hello.number("proto")?.toInt())
         assertEquals(CLIENT_ID, hello.text("client"))
         assertTrue(transport.binaries.isEmpty())
         assertNull(speaker.format, "playback cannot open before the server declares its rate")
@@ -100,7 +100,7 @@ class YammerClientTest {
     fun `a close releases the speaker and returns to idle`() {
         connect()
         say(Wake.START)
-        client.onClosed(CloseCode.ALREADY_CONNECTED, "client already connected")
+        client.onClosed(1000, "server closed the connection")
 
         assertEquals(YammerClient.State.IDLE, client.state)
         assertEquals(1, speaker.closes)
@@ -533,7 +533,7 @@ class YammerClientTest {
     private fun connect(rate: Int = 24_000) {
         client.onOpen(transport)
         client.onText(
-            """{"t":"hello.ok","proto":2,"server":"yammer-server/0.1.0",""" +
+            """{"t":"hello.ok","proto":3,"server":"yammer-server/0.1.0",""" +
                 """"audio":{"codec":"pcm_s16le","rate":$rate,"channels":1}}"""
         )
     }

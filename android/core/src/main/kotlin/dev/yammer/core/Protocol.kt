@@ -21,7 +21,7 @@ import kotlinx.serialization.json.put
  * *are* the contract.
  */
 
-const val PROTOCOL_VERSION = 2
+const val PROTOCOL_VERSION = 3
 
 /**
  * Deliberately not the Python client's `yammer-client/0.1.0`.
@@ -32,19 +32,23 @@ const val PROTOCOL_VERSION = 2
  */
 const val CLIENT_ID = "yammer-android/0.1.0"
 
-/** Application-specific WebSocket close codes. */
+/**
+ * Application-specific WebSocket close codes.
+ *
+ * `4004 ALREADY_CONNECTED` was retired in v3: the server takes as many clients
+ * as want to connect, each with its own active workspace. The number is left
+ * unused rather than recycled.
+ */
 object CloseCode {
     const val AUTH_FAILED = 4001
     const val UNSUPPORTED_PROTOCOL = 4002
     const val PROTOCOL_VIOLATION = 4003
-    const val ALREADY_CONNECTED = 4004
 }
 
 val CLOSE_REASONS: Map<Int, String> = mapOf(
     CloseCode.AUTH_FAILED to "the server rejected the token",
     CloseCode.UNSUPPORTED_PROTOCOL to "the server speaks a different protocol version",
     CloseCode.PROTOCOL_VIOLATION to "the server reported a protocol violation",
-    CloseCode.ALREADY_CONNECTED to "another client is already connected",
 )
 
 data class AudioFormat(val codec: String, val rate: Int, val channels: Int) {

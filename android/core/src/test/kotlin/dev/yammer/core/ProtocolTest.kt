@@ -56,7 +56,6 @@ class ProtocolTest {
         assertEquals(codes.int("AUTH_FAILED"), CloseCode.AUTH_FAILED)
         assertEquals(codes.int("UNSUPPORTED_PROTOCOL"), CloseCode.UNSUPPORTED_PROTOCOL)
         assertEquals(codes.int("PROTOCOL_VIOLATION"), CloseCode.PROTOCOL_VIOLATION)
-        assertEquals(codes.int("ALREADY_CONNECTED"), CloseCode.ALREADY_CONNECTED)
         assertEquals(codes.keys, CLOSE_REASONS.keys.map { code -> nameOf(code) }.toSet())
     }
 
@@ -221,11 +220,11 @@ class ProtocolTest {
 
         val hello = assertIs<ServerMessage.HelloOk>(
             parsed(
-                """{ "t": "hello.ok", "proto": 2, "server": "yammer-server/0.1.0",
+                """{ "t": "hello.ok", "proto": 3, "server": "yammer-server/0.1.0",
                      "audio": { "codec": "pcm_s16le", "rate": 24000, "channels": 1 } }"""
             )
         )
-        assertEquals(2, hello.proto)
+        assertEquals(3, hello.proto)
         assertEquals("yammer-server/0.1.0", hello.server)
         assertEquals(AudioFormat("pcm_s16le", 24_000, 1), hello.audio)
 
@@ -327,7 +326,6 @@ class ProtocolTest {
         CloseCode.AUTH_FAILED -> "AUTH_FAILED"
         CloseCode.UNSUPPORTED_PROTOCOL -> "UNSUPPORTED_PROTOCOL"
         CloseCode.PROTOCOL_VIOLATION -> "PROTOCOL_VIOLATION"
-        CloseCode.ALREADY_CONNECTED -> "ALREADY_CONNECTED"
         else -> "UNKNOWN_$code"
     }
 

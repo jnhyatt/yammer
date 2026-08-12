@@ -59,8 +59,7 @@ class WebSocketTransport(
         /**
          * The server has sent a close frame. Acknowledge it before reporting:
          * without this the socket stays half-open until the read times out, and
-         * a `4004 already connected` would look like a hang rather than an
-         * answer.
+         * a `4001 auth failed` would look like a hang rather than an answer.
          */
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
             webSocket.close(code, null)

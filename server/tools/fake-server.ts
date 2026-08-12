@@ -17,6 +17,13 @@
  * router, real OpenCode and real Kokoro would make the check depend on four
  * network services and a GPU to tell you whether a JSON field was misspelled.
  *
+ * v3 added workspaces, and a connection starts in none of them — see
+ * PROTOCOL.md's "Connection lifecycle". This registers exactly one, already
+ * `ready` and already watching its (fake) permission stream, and treats the
+ * very first utterance any connection sends as "load" into it, the same way
+ * `ws-server.test.ts`'s `TestClient.enter()` does. A driver only needs to run
+ * one ordinary-looking turn before the ones it actually wants to assert on.
+ *
  *   node --experimental-strip-types tools/fake-server.ts [--port N]
  *
  * Prints `listening <port>` on stdout once, then serves until killed.
@@ -26,10 +33,15 @@ import type { AddressInfo } from "node:net";
 
 import type { Config } from "../src/config.ts";
 import { setLogLevel } from "../src/log.ts";
-import type { PermissionRequest, PermissionReply } from "../src/opencode/permissions.ts";
+import type { OpenCodeClient } from "../src/opencode/client.ts";
+import type { PermissionReply, PermissionRequest, PermissionWatcher } from "../src/opencode/permissions.ts";
+import { Workspace, WorkspaceRegistry } from "../src/workspace.ts";
 import { startServer, type Deps } from "../src/ws-server.ts";
 
 const TOKEN = "s3cret-token";
+
+/** The one workspace this fake registers. A driver loads it before anything else. */
+const WORKSPACE = "test";
 
 /**
  * The transcript reports how many bytes of audio actually arrived.
@@ -62,6 +74,14 @@ function main(): void {
   let askPermission: ((request: PermissionRequest) => void) | null = null;
   let prompts = 0;
 
+  /**
+   * Whether some connection's first utterance — the "load" turn every driver
+   * has to send now that a connection starts in no workspace — has been seen.
+   * A single mutable flag is enough because the fixture is one server per test.
+   */
+  let entered = false;
+  const ENTER_TRANSCRIPT = `load ${WORKSPACE}`;
+
   const stt = {
     // `classify` is the only caller that passes a bias prompt, which is what
     // distinguishes "transcribe this utterance" from "what did they answer".
@@ -69,19 +89,32 @@ function main(): void {
       audio: Buffer,
       _signal?: AbortSignal,
       options?: { prompt?: string },
-    ): Promise<string> => (options?.prompt ? "approve" : transcriptFor(audio)),
+    ): Promise<string> => {
+      if (options?.prompt) return "approve";
+      if (!entered) {
+        entered = true;
+        return ENTER_TRANSCRIPT;
+      }
+      return transcriptFor(audio);
+    },
   };
 
   const router = {
-    route: async () => ({ action: "forward" }),
+    route: async (transcript: string) => {
+      if (transcript === ENTER_TRANSCRIPT) {
+        return { action: "load_workspace", workspace: WORKSPACE };
+      }
+      return { action: "forward", workspace: "" };
+    },
   };
 
   const opencode = {
-    currentSessionId: "ses_fake",
+    createSession: async (): Promise<string> => "ses_fake",
     /**
      * The second prompt of the session asks for permission before answering,
-     * so a driver gets both paths by running two turns — no side channel and
-     * nothing to configure.
+     * so a driver gets both paths by running two forwarded turns — no side
+     * channel and nothing to configure. Entering the workspace does not call
+     * this, so the count is unaffected by the turn that "load" spends.
      */
     prompt: async (): Promise<string> => {
       prompts += 1;
@@ -106,6 +139,19 @@ function main(): void {
     },
   };
 
+  const permissions = {
+    onAsked: (handler: (request: PermissionRequest) => void) => {
+      askPermission = handler;
+    },
+    start: (): void => {},
+    stop: (): void => {},
+    reply: async (_id: string, reply: PermissionReply): Promise<void> => {
+      const settle = settlePermission;
+      settlePermission = null;
+      settle?.(reply);
+    },
+  };
+
   const tts = {
     async *synthesize(text: string) {
       // One segment per sentence, as Kokoro does.
@@ -116,15 +162,32 @@ function main(): void {
     },
   };
 
-  const permissions = {
-    onAsked: (handler: (request: PermissionRequest) => void) => {
-      askPermission = handler;
-    },
-    reply: async (_id: string, reply: PermissionReply): Promise<void> => {
-      const settle = settlePermission;
-      settlePermission = null;
-      settle?.(reply);
-    },
+  // The concrete classes carry private fields, so structural assignment won't
+  // do. These fakes implement everything the server path touches; the cast is
+  // the price of not standing up a container runtime and a real OpenCode.
+  const workspace = new Workspace({
+    name: WORKSPACE,
+    // Deliberately not a real directory: nothing here exercises the supervisor's
+    // grounded `git diff` clause. `git.test.ts` covers that against real repos.
+    workDir: "/nonexistent/test",
+    baseUrl: "http://127.0.0.1:0",
+    opencode: opencode as unknown as OpenCodeClient,
+    permissions: permissions as unknown as PermissionWatcher,
+  });
+  // Real deployments start watching once a workspace is `ready` — `index.ts` on
+  // boot, `WorkspaceManager` on create/load. This fake has no lifecycle class
+  // standing in for either, so it does the one thing they both do for a
+  // workspace that is ready from the start.
+  workspace.startWatching();
+
+  const workspaces = new WorkspaceRegistry([workspace]);
+
+  // Already registered and already `ready`, so `load` is only ever the switch.
+  // The lifecycle's own failure points have their own suite.
+  const manager = {
+    create: async (name: string) => ({ name }),
+    load: async (name: string) => ({ name }),
+    delete: async (_name: string): Promise<void> => {},
   };
 
   const config: Config = {
@@ -133,17 +196,24 @@ function main(): void {
     token: TOKEN,
     stt: { baseUrl: "", apiKey: "", model: "" },
     router: { baseUrl: "", apiKey: "", model: "" },
-    opencode: { baseUrl: "", projectDir: "/tmp", agent: "yammer" },
+    opencode: { agent: "yammer" },
+    state: { dir: "/tmp" },
+    container: { socketPath: "/nonexistent.sock" },
+    workspaces: {
+      image: "localhost/yammer-opencode:latest",
+      root: "/tmp",
+      agentFile: "/nonexistent/yammer.md",
+      authFile: "/nonexistent/auth.json",
+      readySeconds: 1,
+      stopSeconds: 1,
+    },
     supervisor: { voice: "bm_george", answerSeconds: 10, maxAttempts: 3 },
     tts: { modelId: "", dtype: "q8", voice: "af_heart", device: "cpu" },
     logLevel: "error",
     envFile: null,
   };
 
-  // The concrete classes carry private fields, so structural assignment won't
-  // do. These fakes implement everything the server path touches; the cast is
-  // the price of not standing up Groq, OpenRouter, OpenCode and Kokoro.
-  const deps = { stt, router, opencode, tts, permissions } as unknown as Deps;
+  const deps = { stt, router, workspaces, manager, tts } as unknown as Deps;
 
   const wss = startServer(config, deps);
   wss.on("listening", () => {
