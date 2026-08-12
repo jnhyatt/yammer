@@ -36,10 +36,15 @@ export interface Config {
     model: string;
   };
 
+  /**
+   * How Yammer talks to the OpenCode inside a workspace — not *which* one.
+   *
+   * There is no base URL or project directory here any more: every workspace is
+   * a container Yammer created, reached on its own published loopback port, and
+   * scoped to its own bind-mounted directory. What is left is the settings that
+   * are the same in all of them.
+   */
   opencode: {
-    baseUrl: string;
-    /** The single directory OpenCode's filesystem access is scoped to. */
-    projectDir: string;
     /** Optional provider/model override for OpenCode itself. */
     providerId?: string;
     modelId?: string;
@@ -234,8 +239,6 @@ export function loadConfig(): Config {
     },
 
     opencode: {
-      baseUrl: optional("YAMMER_OPENCODE_URL", "http://127.0.0.1:4096"),
-      projectDir: required("YAMMER_PROJECT_DIR"),
       providerId: process.env["YAMMER_OPENCODE_PROVIDER"] || undefined,
       modelId: process.env["YAMMER_OPENCODE_MODEL"] || undefined,
       agent,

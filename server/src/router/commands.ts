@@ -24,7 +24,12 @@ import {
   workspaceMatchKey,
 } from "../lifecycle.ts";
 import type { Stakes } from "../supervisor/approval.ts";
-import { WorkspaceUnknownError, type SessionController, type WorkspaceStatus } from "../workspace.ts";
+import {
+  NoWorkspaceError,
+  WorkspaceUnknownError,
+  type SessionController,
+  type WorkspaceStatus,
+} from "../workspace.ts";
 
 /**
  * The lifecycle verbs, as the commands need them.
@@ -49,9 +54,13 @@ export interface WorkspaceDirectory {
   list(): ReadonlyArray<{ name: string; status: WorkspaceStatus; workDir: string }>;
 }
 
-/** The one client's active workspace. `load` is the only thing that moves it. */
+/**
+ * The one client's active workspace. `load` is the only thing that moves it.
+ *
+ * Null means the client is not in one — the state every connection starts in.
+ */
 export interface ActiveWorkspace {
-  readonly activeWorkspaceName: string;
+  readonly activeWorkspaceName: string | null;
   setActive(name: string): void;
 }
 
@@ -62,8 +71,15 @@ export interface ActiveWorkspace {
  * `confirm` reach the client that spoke rather than some global output.
  */
 export interface CommandContext {
-  /** This client's conversation in its active workspace. */
-  session: SessionController;
+  /**
+   * This client's conversation in its active workspace.
+   *
+   * A function, and resolved late, because a client that is not in a workspace
+   * yet can still run `create`, `load` and `list` — only the commands that
+   * actually talk to OpenCode need one, and for those a missing workspace is a
+   * `NoWorkspaceError` with its own sentence.
+   */
+  session(): SessionController;
   /** Every workspace Yammer knows about. */
   registry: WorkspaceDirectory;
   /** create / load / delete. */
@@ -126,7 +142,7 @@ export const META_COMMANDS: readonly MetaCommand[] = [
       "how many tokens have we used",
     ],
     async run({ session }) {
-      const stats = await session.usage();
+      const stats = await session().usage();
       if (stats.messages === 0) {
         return "This session hasn't used any tokens yet.";
       }
@@ -150,7 +166,7 @@ export const META_COMMANDS: readonly MetaCommand[] = [
       "the context is getting long, compact it",
     ],
     async run({ session }) {
-      await session.compact();
+      await session().compact();
       return "Session compacted.";
     },
   },
@@ -167,7 +183,7 @@ export const META_COMMANDS: readonly MetaCommand[] = [
       "forget everything, fresh session",
     ],
     async run({ session }) {
-      await session.startNewSession();
+      await session().startNewSession();
       return "Started a new session.";
     },
   },
@@ -241,7 +257,9 @@ export const META_COMMANDS: readonly MetaCommand[] = [
     ],
     async run(context) {
       const workspaces = context.registry.list();
-      if (workspaces.length === 0) return "You have no workspaces yet.";
+      if (workspaces.length === 0) {
+        return "You have no workspaces yet. Say create a workspace, and a name, to make one.";
+      }
 
       const active = context.client.activeWorkspaceName;
       const entries = workspaces.map((workspace) => {
@@ -250,7 +268,10 @@ export const META_COMMANDS: readonly MetaCommand[] = [
       });
       const count =
         workspaces.length === 1 ? "one workspace" : `${workspaces.length} workspaces`;
-      return `You have ${count}. ${entries.join(". ")}.`;
+      // Which one you are in is half of what this command is for, so the answer
+      // "none of them" has to be said rather than left as an absent clause.
+      const where = active === null ? " You're not in one right now." : "";
+      return `You have ${count}. ${entries.join(". ")}.${where}`;
     },
   },
   {
@@ -300,6 +321,14 @@ export function findCommand(name: string): MetaCommand | undefined {
  * what happened and, where there is one, what would fix it.
  */
 export function spokenWorkspaceError(cause: unknown): string | null {
+  if (cause instanceof NoWorkspaceError) {
+    // Every connection starts here, so this is the first thing a new client
+    // hears if it speaks before saying where. It has to name the way out.
+    return (
+      "You're not in a workspace yet. Say load, and the name, to enter one, " +
+      "or list workspaces to hear what there is."
+    );
+  }
   if (cause instanceof WorkspaceUnknownError) {
     return (
       `I don't know a workspace called ${spokenName(cause.workspace)}. ` +

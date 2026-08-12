@@ -83,6 +83,8 @@ export type ErrorCode =
   | "opencode_error"
   | "tts_failed"
   | "supervisor_failed"
+  /** The client is not in a workspace and said something that needs one. */
+  | "no_workspace"
   /** No workspace of that name. Never an implicit create. */
   | "workspace_unknown"
   /** It exists, and it did not come up: container, port, or OpenCode itself. */

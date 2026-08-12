@@ -31,7 +31,12 @@ import {
 } from "./supervisor/approval.ts";
 import type { PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine, TtsError } from "./tts/kokoro.ts";
-import { WorkspaceUnknownError, type ClientWorkspaces, type WorkspaceSession } from "./workspace.ts";
+import {
+  NoWorkspaceError,
+  WorkspaceUnknownError,
+  type ClientWorkspaces,
+  type WorkspaceSession,
+} from "./workspace.ts";
 
 /** How the orchestrator talks back to whoever owns the socket. */
 export interface TurnSink {
@@ -227,13 +232,15 @@ export class TurnManager {
     const audio = Buffer.concat(turn.chunks);
 
     // Resolved once, here, rather than held from construction: which project a
-    // turn belongs to is a property of the client's state when it speaks.
-    const session = this.client.session();
+    // turn belongs to is a property of the client's state when it speaks. It
+    // may be nothing at all — a client that has not said `load` yet can still
+    // create, load and list, so this is only fatal for what actually needs it.
+    const session = this.client.active === null ? null : this.client.session();
     turn.session = session;
     log.info("processing utterance", {
       turn: id,
       bytes: audio.length,
-      workspace: session.workspace.name,
+      workspace: session?.workspace.name ?? "(none)",
     });
 
     let transcript: string;
@@ -252,7 +259,7 @@ export class TurnManager {
       this.sink.send({ t: "turn.status", turn: id, state: "routing" });
       const decision = await this.router.route(
         transcript,
-        { sessionId: session.currentSessionId, turnCount: this.replyCount },
+        { sessionId: session?.currentSessionId ?? null, turnCount: this.replyCount },
         signal,
       );
       action = decision.action;
@@ -267,6 +274,13 @@ export class TurnManager {
     let spoken: string;
     let outcome: TurnOutcome;
     if (action === "forward") {
+      if (!session) {
+        // Nothing to forward to. The client's very first utterance lands here
+        // if it speaks before saying where, which is why the sentence names the
+        // way out rather than just reporting the state.
+        const cause = new NoWorkspaceError();
+        return this.fail(id, "no_workspace", spokenWorkspaceError(cause)!, cause);
+      }
       try {
         spoken = await session.prompt(transcript, signal);
         this.replyCount += 1;
@@ -289,7 +303,7 @@ export class TurnManager {
         return this.fail(id, "internal", "I didn't understand that command.", action);
       }
       try {
-        spoken = await command.run(this.commandContext(id, session, argument, signal));
+        spoken = await command.run(this.commandContext(id, argument, signal));
         outcome = "meta_command";
       } catch (cause) {
         // A workspace command's failures have their own sentences — the
@@ -314,12 +328,13 @@ export class TurnManager {
    */
   private commandContext(
     turn: number,
-    session: WorkspaceSession,
     argument: string,
     signal: AbortSignal,
   ): CommandContext {
     return {
-      session,
+      // Not the turn's own `session`: a command asks for one only if it needs
+      // it, and gets the error with its own sentence when there is none.
+      session: () => this.client.session(),
       registry: this.workspaces.registry,
       manager: this.workspaces.manager,
       client: this.client,
@@ -403,6 +418,7 @@ function spokenSttError(cause: unknown): string {
 
 /** Which of the three workspace codes a lifecycle failure is. */
 function workspaceCode(cause: unknown): ErrorCode {
+  if (cause instanceof NoWorkspaceError) return "no_workspace";
   if (cause instanceof WorkspaceUnknownError) return "workspace_unknown";
   if (!(cause instanceof WorkspaceLifecycleError)) return "internal";
   switch (cause.kind) {

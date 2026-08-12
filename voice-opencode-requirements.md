@@ -15,7 +15,9 @@ Client/server split, connected over a single WebSocket connection.
 
 The two halves are in different languages by deliberate choice: each uses the library that is native to its job. The cost is that the WebSocket protocol is a real cross-language contract rather than a shared type definition — see §2, which raises it from an implementation detail to a specified component.
 
-The client only operates within a specific project directory it's configured for; OpenCode's filesystem access is scoped to that directory. No remote-repo access, no credentials handling beyond the transport token (§2), no elevated permissions in v1.
+~~The client only operates within a specific project directory it's configured for; OpenCode's filesystem access is scoped to that directory.~~ No remote-repo access, no credentials handling beyond the transport token (§2), no elevated permissions in v1.
+
+**Amended by [yammer-server-v2.md](yammer-server-v2.md).** The scoping survives and is stronger — each project is a container, and the directory is a bind mount rather than a configured path — but it is no longer *a* directory, and it is no longer the client that is configured with it. The client is told nothing about workspaces; it starts in none, and the user says which one they are in. What still holds: no credentials in the container, no elevated permissions, and OpenCode never seeing the host's file tree.
 
 ## Operating assumptions
 

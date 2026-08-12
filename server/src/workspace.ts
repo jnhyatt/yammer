@@ -1,11 +1,10 @@
 /**
  * Workspaces, and the sessions people hold in them.
  *
- * A **workspace** is one project Yammer can work on: a directory, an OpenCode
- * server scoped to it, and the permission stream that server publishes. From
- * phase 2 each one is a container Yammer starts on demand; today there is
- * exactly one, standing in front of the `opencode serve` that the Quadlet unit
- * already runs. Nothing below assumes which of those is true.
+ * A **workspace** is one project Yammer can work on: a host directory, a
+ * container running an OpenCode scoped to it, and the permission stream that
+ * OpenCode publishes. Every one of them is created by Yammer, so a fresh
+ * install has none at all and a client is in none until it says `load`.
  *
  * A **session** is a conversation, and belongs to a (client, workspace) pair
  * rather than to the workspace. Two people working on the same project get two
@@ -20,8 +19,6 @@
  * builds that routing table, and a request whose owner has gone away is refused
  * rather than left blocking OpenCode forever.
  */
-
-import { basename } from "node:path";
 
 import type { Config } from "./config.ts";
 import { CONTAINER_WORKDIR } from "./container/runtime.ts";
@@ -64,6 +61,20 @@ export interface PermissionOwner {
  * this is "I don't know a workspace called X" — saying which one failed is the
  * whole difference between a useful error and a shrug.
  */
+/**
+ * The client is not in a workspace, and has asked for something that needs one.
+ *
+ * Its own type rather than a `WorkspaceUnknownError` with an empty name: "I
+ * don't know a workspace called nothing" is not a sentence, and the fix is
+ * different — there is nothing wrong with what they said, they just have to say
+ * where first.
+ */
+export class NoWorkspaceError extends Error {
+  constructor() {
+    super("no active workspace");
+  }
+}
+
 export class WorkspaceUnknownError extends Error {
   readonly workspace: string;
 
@@ -83,9 +94,10 @@ export class Workspace {
 
   /**
    * The container this workspace runs in, or null when it is not Yammer's to
-   * manage. Null is what v1's single workspace looks like: an `opencode serve`
-   * started by a Quadlet unit, which Yammer talks to but must never stop,
-   * remove, or count as drift.
+   * manage. Nothing builds a null one now that every workspace comes from the
+   * registry — but the lifecycle still refuses to stop, remove or delete the
+   * directory of one, because that guard is the last thing between a bad record
+   * and a recursive delete.
    */
   readonly containerId: string | null;
 
@@ -200,24 +212,19 @@ export class Workspace {
 }
 
 /**
- * Every workspace Yammer knows about.
+ * Every workspace Yammer knows about: one per persisted record, and nothing
+ * else.
  *
- * Built at startup from two sources that will become one: the persisted
- * registry (`registry/store.ts`), and the single config-derived workspace v1
- * runs against. The second disappears when phase 2 makes every workspace a
- * container Yammer created.
+ * It can legitimately be **empty**. A fresh install has created no workspaces
+ * yet, and there is no longer a config-derived fallback standing in for one —
+ * that was v1's single `opencode serve`, and keeping it would mean a name in
+ * `list` that answers on a port nothing serves.
  */
 export class WorkspaceRegistry {
   private readonly byName = new Map<string, Workspace>();
-  /** The workspace a client is in before it says otherwise. */
-  readonly defaultName: string;
 
-  constructor(workspaces: readonly Workspace[], defaultName: string) {
+  constructor(workspaces: readonly Workspace[] = []) {
     for (const workspace of workspaces) this.byName.set(workspace.name, workspace);
-    if (!this.byName.has(defaultName)) {
-      throw new Error(`default workspace ${defaultName} is not in the registry`);
-    }
-    this.defaultName = defaultName;
   }
 
   get(name: string): Workspace | undefined {
@@ -244,9 +251,6 @@ export class WorkspaceRegistry {
   }
 
   remove(name: string): void {
-    if (name === this.defaultName) {
-      throw new Error(`the default workspace ${name} cannot be removed`);
-    }
     this.byName.delete(name);
   }
 
@@ -357,16 +361,21 @@ export class WorkspaceSession implements SessionController {
  * resumes rather than restarts. `load` is the only thing that moves a client,
  * and it moves exactly one — the active workspace is per connection, so a
  * second client is never dragged along by the first.
+ *
+ * **A client starts in no workspace at all**, and says `load` to enter one.
+ * There is no default to fall into: with several workspaces, picking one would
+ * mean forwarding "fix the parser bug" into whichever project happened to sort
+ * first, and the user has no screen to notice from. Being nowhere is a spoken
+ * error naming the fix, which costs one utterance and is never wrong.
  */
 export class ClientWorkspaces {
   private readonly registry: WorkspaceRegistry;
   private readonly sessions = new Map<string, WorkspaceSession>();
   private owner: PermissionOwner | null = null;
-  private activeName: string;
+  private activeName: string | null = null;
 
   constructor(registry: WorkspaceRegistry) {
     this.registry = registry;
-    this.activeName = registry.defaultName;
   }
 
   /**
@@ -380,25 +389,21 @@ export class ClientWorkspaces {
     this.owner = owner;
   }
 
-  get active(): Workspace {
+  /** The workspace this client is in, or null if it is not in one. */
+  get active(): Workspace | null {
+    if (this.activeName === null) return null;
     const workspace = this.registry.get(this.activeName);
     if (workspace) return workspace;
-    // The client's workspace was deleted underneath it — by this client in an
-    // earlier turn, or by another one. Falling back to the default is the only
-    // answer that leaves the client able to speak at all; the alternative is a
-    // connection whose every utterance fails on a name that will never resolve
-    // again. The user finds out because the next reply comes from somewhere
-    // else, which is what `list` and the `load` confirmation are for.
-    log.warn("active workspace is gone, falling back to the default", {
-      workspace: this.activeName,
-      fallback: this.registry.defaultName,
-    });
-    this.activeName = this.registry.defaultName;
-    return this.registry.require(this.activeName);
+    // Deleted underneath the client — by this client in an earlier turn, or by
+    // another one. Landing it somewhere else would be worse than landing it
+    // nowhere: the next utterance would go to a project the user never named.
+    log.warn("active workspace is gone", { workspace: this.activeName });
+    this.activeName = null;
+    return null;
   }
 
   /** The name of the workspace this client is in. Spoken by `list`. */
-  get activeWorkspaceName(): string {
+  get activeWorkspaceName(): string | null {
     return this.activeName;
   }
 
@@ -414,9 +419,16 @@ export class ClientWorkspaces {
     this.activeName = name;
   }
 
-  /** The client's conversation in its active workspace, created on demand. */
+  /**
+   * The client's conversation in its active workspace, created on demand.
+   *
+   * Throws `NoWorkspaceError` when the client is not in one. Resolved late, at
+   * the point a turn actually needs OpenCode, so that `create`, `load` and
+   * `list` still work for a client that has nowhere to talk yet.
+   */
   session(): WorkspaceSession {
     const workspace = this.active;
+    if (!workspace) throw new NoWorkspaceError();
     const existing = this.sessions.get(workspace.name);
     // Same name, different workspace: deleted and recreated. The old session id
     // belongs to an OpenCode that no longer exists, so resuming it would prompt
@@ -437,31 +449,6 @@ export class ClientWorkspaces {
     for (const session of this.sessions.values()) session.release();
     this.sessions.clear();
   }
-}
-
-/**
- * The workspace v1 implies: one, from `YAMMER_OPENCODE_URL` and
- * `YAMMER_PROJECT_DIR`, with no container of its own.
- *
- * Named after the project directory rather than something like "default",
- * because that name becomes something the user says out loud in phase 3, and
- * "the yammer workspace" is already how they would refer to it.
- */
-export function workspaceFromConfig(config: Config): Workspace {
-  return new Workspace({
-    name: basename(config.opencode.projectDir),
-    workDir: config.opencode.projectDir,
-    baseUrl: config.opencode.baseUrl,
-    opencode: new OpenCodeClient({
-      baseUrl: config.opencode.baseUrl,
-      directory: config.opencode.projectDir,
-      providerId: config.opencode.providerId,
-      modelId: config.opencode.modelId,
-      agent: config.opencode.agent,
-    }),
-    permissions: new PermissionWatcher(config.opencode.baseUrl, config.opencode.projectDir),
-    status: "ready",
-  });
 }
 
 /**
@@ -498,24 +485,10 @@ export function workspaceFromRecord(record: WorkspaceRecord, config: Config): Wo
   });
 }
 
-/**
- * Assemble the registry from the persisted records plus the config workspace.
- *
- * A name in both is a hard error rather than a precedence rule. It means the
- * user has a workspace named after their `YAMMER_PROJECT_DIR`, and silently
- * shadowing one with the other would make `load` do something other than what
- * the name says — with the wrong one being the one that still holds their work.
- */
-export function buildRegistry(config: Config, records: readonly WorkspaceRecord[]): WorkspaceRegistry {
-  const fallback = workspaceFromConfig(config);
-  const workspaces = records.map((record) => workspaceFromRecord(record, config));
-
-  if (workspaces.some((workspace) => workspace.name === fallback.name)) {
-    throw new Error(
-      `workspace "${fallback.name}" is both in the registry and derived from ` +
-        `YAMMER_PROJECT_DIR (${config.opencode.projectDir}); rename one`,
-    );
-  }
-
-  return new WorkspaceRegistry([fallback, ...workspaces], fallback.name);
+/** The registry, from the persisted records. Empty on a fresh install. */
+export function buildRegistry(
+  config: Config,
+  records: readonly WorkspaceRecord[],
+): WorkspaceRegistry {
+  return new WorkspaceRegistry(records.map((record) => workspaceFromRecord(record, config)));
 }

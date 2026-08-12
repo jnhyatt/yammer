@@ -229,16 +229,24 @@ ordinary `speech.*` segments, then `turn.end`.
   "message": "Could not reach OpenCode." }
 ```
 Codes: `stt_failed`, `stt_empty`, `router_failed`, `opencode_unreachable`,
-`opencode_error`, `tts_failed`, `supervisor_failed`, `workspace_unknown`,
-`workspace_start_failed`, `workspace_failed`, `internal`. `turn` is omitted for
-errors not associated with a turn.
+`opencode_error`, `tts_failed`, `supervisor_failed`, `no_workspace`,
+`workspace_unknown`, `workspace_start_failed`, `workspace_failed`, `internal`.
+`turn` is omitted for errors not associated with a turn.
 
-The three workspace codes are new in v3 and split by what the user would do
-about it: `workspace_unknown` is a name that resolves to nothing (never an
-implicit create), `workspace_start_failed` is a workspace that exists and did
-not come up, `workspace_failed` is everything else — a name clash, an unbuilt
-image. The spoken `message` is finer-grained than the code, deliberately: the
-code drives the client's earcon, the sentence is what the person acts on.
+The workspace codes split by what the user would do about it: `no_workspace`
+means this connection is not in one yet and the utterance needed one,
+`workspace_unknown` is a name that resolves to nothing (never an implicit
+create), `workspace_start_failed` is a workspace that exists and did not come
+up, `workspace_failed` is everything else — a name clash, an unbuilt image. The
+spoken `message` is finer-grained than the code, deliberately: the code drives
+the client's earcon, the sentence is what the person acts on.
+
+`no_workspace` is the one a correct client will meet routinely: **a connection
+starts in no workspace**, and the user enters one by saying so. There is no
+default, because with several workspaces any default is a guess about which
+project an utterance meant, made by the side of the system with no screen to
+show it. The client still learns nothing about workspaces — it plays the earcon
+and speaks what it is sent, exactly as for any other error.
 
 **A client MUST tolerate an unrecognised code**, playing its error earcon and
 speaking nothing of its own. Codes are expected to grow; a new one is not a

@@ -21,8 +21,8 @@ async function main(): Promise<void> {
 
   log.info("starting yammer server", {
     envFile: config.envFile ?? "(none)",
-    workspaces: workspaces.list().map((w) => `${w.name}:${w.status}`).join(","),
-    projectDir: config.opencode.projectDir,
+    workspaces: workspaces.list().map((w) => `${w.name}:${w.status}`).join(",") || "(none)",
+    workspaceRoot: config.workspaces.root,
     sttModel: config.stt.model,
     routerModel: config.router.model,
     opencodeAgent: config.opencode.agent,

@@ -27,7 +27,7 @@ import { before, describe, it } from "node:test";
 import { LIFECYCLE_FAILURES, WorkspaceLifecycleError } from "../lifecycle.ts";
 import { setLogLevel } from "../log.ts";
 import type { Stakes } from "../supervisor/approval.ts";
-import { WorkspaceUnknownError, type WorkspaceStatus } from "../workspace.ts";
+import { NoWorkspaceError, WorkspaceUnknownError, type WorkspaceStatus } from "../workspace.ts";
 import {
   findCommand,
   spokenWorkspaceError,
@@ -45,14 +45,15 @@ interface Recorded {
   deleted: string[];
   /** Each spoken gate: what it described, and what it declared at stake. */
   asked: Array<{ description: string; stakes: Stakes | null }>;
-  active: string;
+  active: string | null;
 }
 
 interface Setup {
   argument: string;
   /** The registry the command sees. Defaults to one ready workspace. */
   workspaces?: Array<{ name: string; status: WorkspaceStatus; workDir?: string }>;
-  active?: string;
+  /** Null is a client that has not entered a workspace yet. */
+  active?: string | null;
   /** What the spoken gate answers. Defaults to deny — silence is a no. */
   approve?: boolean;
   /** Thrown by whichever lifecycle verb the command reaches for. */
@@ -69,14 +70,18 @@ function harness(setup: Setup): { context: CommandContext; recorded: Recorded } 
     loaded: [],
     deleted: [],
     asked: [],
-    active: setup.active ?? "yammer",
+    active: setup.active === undefined ? "yammer" : setup.active,
   };
   const raise = () => {
     if (setup.fail) throw setup.fail;
   };
 
   const context: CommandContext = {
-    session: {} as CommandContext["session"],
+    // None of the workspace commands ask for a session, and a client with no
+    // active workspace could not be given one — reaching for it is the failure.
+    session: () => {
+      throw new NoWorkspaceError();
+    },
     registry: { list: () => workspaces },
     manager: {
       create: async (spoken) => {
@@ -166,6 +171,14 @@ describe("spoken workspace errors", () => {
     const unusable = spokenWorkspaceError(new WorkspaceLifecycleError("bad-name", "???", "x"));
     assert.notEqual(empty, unusable);
     assert.match(empty!, /didn't catch/);
+  });
+
+  it("tells a client with no workspace how to get into one", () => {
+    // Every connection starts here, so this sentence is the first thing a new
+    // client hears if it speaks before saying where.
+    const sentence = spokenWorkspaceError(new NoWorkspaceError());
+    assert.match(sentence!, /not in a workspace/);
+    assert.match(sentence!, /load/);
   });
 
   it("passes on anything that is not a workspace failure", () => {
@@ -293,6 +306,25 @@ describe("list_workspaces", () => {
     assert.match(spoken, /yammer, ready, where you are now/);
     assert.match(spoken, /space game, stopped/);
     assert.match(spoken, /old test, missing its container/);
+  });
+
+  it("says so when the client is not in any of them", async () => {
+    const { context } = harness({
+      argument: "",
+      active: null,
+      workspaces: [
+        { name: "yammer", status: "ready" },
+        { name: "space-game", status: "stopped" },
+      ],
+    });
+    const spoken = await command("list_workspaces").run(context);
+    assert.doesNotMatch(spoken, /where you are now/);
+    assert.match(spoken, /not in one right now/);
+  });
+
+  it("tells a user with no workspaces at all how to make one", async () => {
+    const { context } = harness({ argument: "", active: null, workspaces: [] });
+    assert.match(await command("list_workspaces").run(context), /create a workspace/);
   });
 
   it("counts one workspace in words rather than digits", async () => {

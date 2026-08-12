@@ -1,7 +1,0 @@
-[Unit]
-Description=Build the yammer-opencode container image
-
-[Build]
-ImageTag=localhost/yammer-opencode:latest
-File=%h/yammer/containers/yammer-opencode/Containerfile
-SetWorkingDirectory=%h/yammer

@@ -555,23 +555,70 @@ rather than a state that lasted one commit.
 
 ---
 
-## Cleanup, once phase 2 lands
+## Cleanup, once phase 2 lands ✅
 
 Yammer no longer runs in a container, so these describe something that no longer
 exists and should go rather than rot:
 
-- [`containers/yammer-server/Containerfile`](containers/yammer-server/Containerfile)
-- [`quadlet/yammer-server.container`](quadlet/yammer-server.container) and
-  `yammer-server.build`
-- [`quadlet/yammer.network`](quadlet/yammer.network) — containers never need to
-  reach each other, and Yammer reaches them on published loopback ports.
-- [`quadlet/yammer-opencode.container`](quadlet/yammer-opencode.container) stops
-  being a unit and becomes the template Yammer applies per workspace.
+- `containers/yammer-server/Containerfile`
+- `quadlet/yammer-server.container` and `yammer-server.build`
+- `quadlet/yammer.network` — containers never need to reach each other, and
+  Yammer reaches them on published loopback ports.
+- `quadlet/yammer-opencode.container` stops being a unit and becomes the
+  template Yammer applies per workspace.
 
 `YAMMER_PROJECT_DIR` and `YAMMER_OPENCODE_URL` stop being meaningful as single
 values and are replaced by a workspace root directory, image name, runtime
 socket path, and readiness timeout. Per the repo's own convention, each goes in
 the config module, the README table, and `.env.example` together.
+
+### What landed
+
+**The whole `quadlet/` directory went, not just the four files.** The workspace
+"template" the last bullet asks for already exists — it is `lifecycle.ts` plus
+`container/podman.ts`, which build the container over the REST socket — so
+keeping a unit file of the same mounts would have been a second copy of it, in a
+format nothing reads. The one thing in there still worth having was how to build
+the image, and `server/README.md` already documented that `podman build`. Yammer
+itself has no service unit yet; it is started by hand, and that is noted in
+`todo.txt` rather than invented here.
+
+**The config-derived workspace went with them**, which is the part with real
+behaviour attached. `YAMMER_PROJECT_DIR` and `YAMMER_OPENCODE_URL` are gone from
+the config, the README table and `.env.example`; `workspaceFromConfig` is gone;
+`WorkspaceRegistry` no longer has a `defaultName` and can legitimately be empty.
+Keeping it would have left a workspace in `list` whose OpenCode was the
+`opencode serve` the deleted Quadlet unit used to run — a name that answers on a
+port nothing serves.
+
+Which forced the question the plan did not ask: **what workspace is a client in
+when it connects?** The answer is none, and it says so.
+
+- A connection starts in no workspace and enters one by saying `load`. With
+  several workspaces, any default is a guess about which project an utterance
+  meant, made by the side of the system with no screen to show the guess. The
+  cost is one utterance per connection; the alternative is forwarding "fix the
+  parser bug" into whichever project sorted first.
+- Speaking before entering one is an error with its own code — `no_workspace`,
+  the fourth workspace code — and a sentence that names the way out. **The
+  protocol stays at 3**: PROTOCOL.md already requires clients to tolerate an
+  unrecognised code, which is exactly what that rule was written for, and the
+  client branches on none of them.
+- A workspace deleted underneath a client leaves it nowhere rather than
+  somewhere. The old fallback-to-default was the only sensible answer while a
+  default existed; without one, "nowhere" is also the more honest one.
+- The session is resolved late, at the point a turn actually needs OpenCode, so
+  `create`, `load` and `list` still work for a client that has nowhere to talk
+  yet. `list` says "you're not in one right now", because which one you are in
+  is half of what that command is for.
+
+The socket tests grew a `TestClient.enter()` that runs a real `load` turn, since
+a test that forwards now has to say where first. That is more setup per test and
+also more honest: the connect-then-load flow is what a real client does.
+
+**Verified:** 221/221 tests (4 new), clean typecheck, `protocol.test.ts` green
+against the unchanged fixture (the Python client enumerates no error codes, so
+there was nothing to regenerate), and the live run below.
 
 ## Risks worth naming
 

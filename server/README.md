@@ -8,8 +8,15 @@ Runs TypeScript directly under Node's type stripping — there is no build step.
 ## Requirements
 
 - **Node 22+** (developed on 24).
-- A running `opencode serve` (default `http://127.0.0.1:4096`).
+- **Rootless Podman**, with its user socket enabled
+  (`systemctl --user enable --now podman.socket`). Yammer runs each workspace as
+  a container and exits at startup if it cannot reach the socket.
+- The workspace image, built once — see "Workspace containers" below.
 - API keys for STT and the routing LLM.
+
+There is no `opencode serve` to run by hand any more: every workspace is a
+container Yammer starts, and a fresh install has none until you say "create a
+workspace".
 
 The Kokoro weights (~90 MB at `q8`) download on first run and are cached by
 `@huggingface/transformers`. The server loads them before it starts listening,
@@ -62,8 +69,6 @@ halves of the system.
 | `YAMMER_ROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | |
 | `YAMMER_ROUTER_API_KEY` | *(required)* | |
 | `YAMMER_ROUTER_MODEL` | `deepseek/deepseek-v4-flash` | Fixed in config by design; see `npm run eval:router` |
-| `YAMMER_OPENCODE_URL` | `http://127.0.0.1:4096` | |
-| `YAMMER_PROJECT_DIR` | *(required)* | The only directory OpenCode can touch |
 | `YAMMER_OPENCODE_PROVIDER` | *(OpenCode's default)* | See "OpenCode model" below before relying on the default |
 | `YAMMER_OPENCODE_MODEL` | *(OpenCode's default)* | |
 | `YAMMER_OPENCODE_AGENT` | `yammer` | The TTS-aware agent; see "OpenCode agent" below |
@@ -112,8 +117,9 @@ Two adjacent options that look right but aren't:
   OpenCode doesn't expose in `config.providers()`; if it starts erroring under
   real use, that's the first thing to suspect.
 
-To see what your account currently has, hit a running `opencode serve` directly:
-`curl http://127.0.0.1:4096/config/providers | jq`.
+To see what your account currently has, ask a running workspace's OpenCode
+directly — its port is in the registry:
+`curl http://127.0.0.1:<port>/config/providers | jq`.
 
 ### OpenCode agent
 
@@ -141,22 +147,20 @@ Two things about it are load-bearing and easy to undo by accident:
   container, so they fail by themselves. `external_directory` is `deny`, which
   is what keeps the agent inside the project directory.
 - **OpenCode reads agent files once at boot and does not hot-reload them.** After
-  editing the agent, restart `opencode serve` or nothing changes. The server logs
-  `opencode agent available` at startup when the agent resolves, and warns if it
-  does not — that warning almost always means a stale `opencode serve`.
+  editing the agent, restart the workspace container or nothing changes. The
+  server logs `opencode agent available` when a workspace's agent resolves, and
+  warns if it does not — that warning almost always means a container that has
+  been up since before the edit.
 
-The agent must be visible to OpenCode in whatever directory `YAMMER_PROJECT_DIR`
-points at. When that's this repository, the checked-in file already is. Pointing
-Yammer at another project needs a global copy:
+Nothing has to be copied anywhere: `YAMMER_AGENT_FILE` is bind-mounted read-only
+into every workspace container, so a fresh workspace with an empty working
+directory still gets the agent. That is deliberate — an agent that lived in the
+project being worked on would leave every new workspace running with screen-
+shaped output and no permission gate at all. Editing it needs no image rebuild,
+but does need the affected container restarted.
 
-```sh
-mkdir -p ~/.config/opencode/agent
-cp .opencode/agent/yammer.md ~/.config/opencode/agent/yammer.md
-```
-
-Both locations are valid (`.opencode/agent/` and `.opencode/agents/` are
-accepted, project-scoped merging over global). To fall back to OpenCode's default
-agent — expect screen formatting read aloud — set `YAMMER_OPENCODE_AGENT=build`.
+To fall back to OpenCode's default agent — expect screen formatting read aloud —
+set `YAMMER_OPENCODE_AGENT=build`.
 
 ### Supervisor
 
@@ -366,6 +370,13 @@ least reliable input in it. The prompt says what is in the directory — Yammer'
 own `git status` of it, not the workspace's account of itself — because "delete
 space game" has to sound different when space game holds a week of uncommitted
 work.
+
+**A connection starts in no workspace, and `load` is how you enter one.** There
+is no default: with several workspaces, any default is a guess about which
+project an utterance meant, made by the side of the system with no screen to
+show its guess. Speaking before entering one is an error that names the way out
+(`no_workspace`), which costs one utterance and is never wrong. A reconnecting
+client says `load` again.
 
 **The active workspace is per connection.** Several clients may be connected at
 once, each in its own workspace, and nothing one client says moves another. Two

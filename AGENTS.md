@@ -43,8 +43,7 @@ android/core/          the wake-word feature pipeline — pure Kotlin/JVM, teste
 android/models/        the five .onnx files, checked in, digests pinned by the fixture
 fixtures/              language-neutral test data every implementation is checked against — see fixtures/README.md
 .opencode/agent/       the TTS-aware OpenCode agent every turn is prompted with
-containers/            Containerfiles for the server and OpenCode images
-quadlet/               Podman Quadlet units to run both as systemd services — see quadlet/README.md
+containers/            the Containerfile for the workspace image Yammer runs
 voice-opencode-requirements.md   scope and design decisions
 android-client-plan.md           the Android client's implementation plan (§9 of the above)
 yammer-server-v2.md              per-project OpenCode containers: scope and design decisions
@@ -304,7 +303,9 @@ Notes here should be things that cost someone time.
   poking the API by hand, `session.prompt()` posts to `/session/{id}/message`
   (`prompt_async` is the one at a `/prompt`-shaped path) — the wrong path returns
   the web UI's HTML with a 200, which looks like a JSON parse bug rather than a
-  404. Verify an agent loaded with `curl "http://127.0.0.1:4096/agent?directory=$YAMMER_PROJECT_DIR"`.
+  404. Verify an agent loaded with `curl "http://127.0.0.1:<workspace port>/agent?directory=/workspace"`
+  — the port is in the registry, and `/workspace` is the bind mount every
+  container sees.
 - **The installed `@opencode-ai/sdk` types lie about permissions.** They
   describe a `permission.updated` event and `POST /session/{id}/permissions/
   {permissionID}` with a `title` field. The running server emits

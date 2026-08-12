@@ -29,8 +29,8 @@ import { setLogLevel } from "./log.ts";
 import { loadRegistry } from "./registry/store.ts";
 import {
   buildRegistry,
+  Workspace,
   WorkspaceUnknownError,
-  type Workspace,
   type WorkspaceRegistry,
 } from "./workspace.ts";
 
@@ -73,7 +73,7 @@ async function harness(overrides: Partial<Config["workspaces"]> = {}): Promise<H
     token: "t",
     stt: { baseUrl: "", apiKey: "", model: "" },
     router: { baseUrl: "", apiKey: "", model: "" },
-    opencode: { baseUrl: "http://127.0.0.1:4096", projectDir: join(root, "project"), agent: "yammer" },
+    opencode: { agent: "yammer" },
     state: { dir: join(root, "state") },
     container: { socketPath: "/nonexistent.sock" },
     workspaces: {
@@ -94,6 +94,20 @@ async function harness(overrides: Partial<Config["workspaces"]> = {}): Promise<H
 
   const runtime = new FakeRuntime();
   const registry = buildRegistry(config, []);
+  // A workspace with no container of its own — nothing Yammer created, and so
+  // nothing Yammer may stop, remove, or delete a directory for. The registry no
+  // longer produces one from config, but the guard against touching one is the
+  // last thing standing between a bad record and a recursive delete, so the
+  // tests still build one by hand.
+  registry.add(
+    new Workspace({
+      name: "project",
+      workDir: join(root, "project"),
+      baseUrl: "http://127.0.0.1:4096",
+      opencode: {} as Workspace["opencode"],
+      permissions: { stop: () => {} } as unknown as Workspace["permissions"],
+    }),
+  );
   registries.push(registry);
   const registryFile = join(root, "state", "workspaces.json");
   return {
@@ -407,7 +421,7 @@ describe("delete", () => {
       () => h.manager.delete("project"),
       (error: WorkspaceLifecycleError) => error.kind === "not-deletable",
     );
-    assert.ok(await exists(h.config.opencode.projectDir));
+    assert.ok(await exists(join(h.root, "project")));
   });
 
   test("refuses a work directory outside the workspace root", async () => {

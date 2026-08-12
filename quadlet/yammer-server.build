@@ -1,7 +1,0 @@
-[Unit]
-Description=Build the yammer-server container image
-
-[Build]
-ImageTag=localhost/yammer-server:latest
-File=%h/yammer/containers/yammer-server/Containerfile
-SetWorkingDirectory=%h/yammer
