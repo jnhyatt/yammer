@@ -1,0 +1,691 @@
+# Yammer v2 — Implementation Plan
+
+The plan for getting from the v1 server (one client, one project, two static
+containers) to the v2 architecture in
+[`yammer-server-v2.md`](yammer-server-v2.md): one uncontainerized daemon
+supervising several per-project OpenCode containers.
+
+Read the requirements doc first. This file is *how* and *in what order*, not
+*what* or *why* — where the two disagree, the requirements doc wins.
+
+**Progress: phases 0–5 are done**, and so is the cleanup below. Each phase
+carries its own status, including what was deviated from and why.
+
+## Where v1 was
+
+Three things in `server/src/index.ts` bound the whole process to one project,
+and every phase below is downstream of unpicking them:
+
+- `OpenCodeSession(config.opencode)` — one base URL, one project directory, one
+  session id, one resolved model. *(Phase 0: split into a per-workspace
+  [`OpenCodeClient`](server/src/opencode/client.ts) and a per-(client,
+  workspace) `WorkspaceSession`.)*
+- `PermissionWatcher(baseUrl, projectDir)` — one SSE stream, started once at
+  boot, filtered by a single `?directory=`. *(Phase 0: one stream per workspace,
+  with a session-id routing table in front of it.)*
+- `startServer` — closes a second client with `4004`. *(Phase 4: retired, along
+  with the protocol version that named it.)*
+
+`TurnManager` and `PermissionSupervisor` are already built per-connection in
+`handleConnection`, which was a genuine head start. They just closed over the
+shared `OpenCodeSession`, so per-connection meant "per connection, same
+project."
+
+Deployment is two Quadlet units with a fixed `%h/yammer:/workspace` bind mount
+and a shared `~/.local/share/opencode`.
+
+## Phasing
+
+Six phases. Each one leaves a working system, and each has a stated done-when
+that is checkable rather than felt. Phases 0–2 are the load-bearing ones; 3–5
+are additive.
+
+| Phase | What lands | Depends on | Status |
+|---|---|---|---|
+| 0 | `Workspace` handle; one workspace, from today's config | — | **done** |
+| 1 | Registry, persistence, startup reconciliation | 0 | **done** |
+| 2 | Container lifecycle behind a runtime interface | 1 | **done** |
+| 3 | Workspace meta-commands + router argument extraction | 2 | **done** |
+| 4 | Multi-client, per-client active workspace, protocol v3 | 3 | **done** |
+| 5 | Supervisor generalization + permission policy rework | 3 | **done** |
+
+Phase 5 depends on 3, not 4 — it can land in parallel with multi-client work.
+
+---
+
+## Phase 0 — the `Workspace` handle ✅
+
+Pure refactor. No behavior change, no new capability, no config change. The
+point is to make every OpenCode-bound singleton addressable by workspace while
+there is still exactly one of them, so the fan-out is a mechanical change
+reviewed on its own rather than tangled into orchestration work.
+
+- Introduce a `Workspace` type owning `{name, baseUrl, workDir, status,
+  OpenCodeSession, PermissionWatcher}`.
+- Introduce a `WorkspaceRegistry` with, for now, exactly one entry constructed
+  from `YAMMER_OPENCODE_URL` + `YAMMER_PROJECT_DIR`.
+- `Deps.opencode` becomes `Deps.workspaces`. `TurnManager` resolves the
+  workspace at the start of a turn rather than holding one from construction.
+- **Sessions become per (client, workspace), not per workspace.** This is the
+  shape the concurrency decision requires; building it now costs nothing and
+  retrofitting it later touches every call site again. The session id moves out
+  of `OpenCodeSession` into a per-connection map keyed by workspace.
+- `PermissionWatcher.onAsked` currently filters against
+  `deps.opencode.currentSessionId` and dispatches to one `TurnManager`. Replace
+  with a `sessionId -> owning turn` registry. A request whose owner is gone is
+  refused, which the existing `supervisor.refuse` path already does.
+
+**Done when:** `npm test` passes unchanged, and a live turn still works end to
+end against the existing Quadlet deployment.
+
+**Watch for:** `OpenCodeSession.resolveModel` caches the resolved model on the
+instance. Per-workspace instances mean per-workspace model resolution, which is
+correct but means the "OpenCode's default model may not work" failure (see
+AGENTS.md) now surfaces once per workspace rather than once per boot.
+
+### What landed
+
+[`workspace.ts`](server/src/workspace.ts) holds `Workspace`,
+`WorkspaceRegistry`, `WorkspaceSession`, and `ClientWorkspaces` (one client's
+active workspace plus its session in each one it has visited).
+`opencode/session.ts` became [`opencode/client.ts`](server/src/opencode/client.ts)
+because it no longer holds a session id; every session-scoped call takes one
+explicitly.
+
+Two deviations, both removing an ordering problem rather than adding scope:
+
+- **The plan says `Workspace` owns an `OpenCodeSession`, and also that the
+  session id moves out of it.** Those cannot both hold in one class, so it split
+  in two: `OpenCodeClient` per workspace (transport, agent, cached model),
+  `WorkspaceSession` per (client, workspace) (the id).
+- **`PermissionSupervisor` no longer takes a watcher or an abort callback at
+  construction.** It takes a `PermissionContext` (`reply` + `abortTurn`) per
+  request. With a permission stream per workspace, "which server do I answer"
+  has to travel with the request — and this is the shape phase 5 generalizes
+  anyway. It also broke the circular construction between the supervisor and
+  the turn manager.
+
+Three tests were *added* to `ws-server.test.ts` rather than the suite passing
+literally unchanged: the claim/refuse routing table is new code whose failure
+mode is a silently wedged `opencode serve` holding a blocked tool call forever.
+
+**Verified:** 93/93 tests, clean typecheck, and 13 checks driving the real
+classes against a live `opencode serve` 1.18.15 — including two clients holding
+distinct sessions in one workspace, which is the capability the phase adds. A
+full voice turn was confirmed later, during phase 1 (see below).
+
+---
+
+## Phase 1 — registry, persistence, reconciliation ✅
+
+Still no container orchestration. The registry gains a durable backing file and
+learns to notice that the world disagrees with it.
+
+- JSON registry at the platform data dir. `env-paths` is the obvious dependency
+  and keeps with the doc's "don't hand-roll per-OS path logic". The server has
+  three runtime dependencies today; this is worth being the fourth, and it is
+  the only new one this plan adds.
+- Persisted per workspace: name, container id, host directory, allocated port,
+  status, creation time.
+- Startup reconciliation: list containers carrying a `yammer.workspace` label,
+  diff against the file, log and speak nothing — the doc's non-goal list is
+  explicit that drift is reported, not healed.
+- Registry writes are small and infrequent; write-temp-then-rename is enough,
+  and there is no concurrent writer to design around because Yammer is one
+  process.
+
+**Done when:** killing a container out from under Yammer and restarting Yammer
+produces an accurate status, and a registry file that has been hand-edited into
+nonsense produces a clear startup error rather than a confusing later one.
+
+### What landed
+
+[`registry/store.ts`](server/src/registry/store.ts) is the file —
+`~/.local/share/yammer/workspaces.json` via `env-paths`, temp-then-rename,
+strict parsing. [`registry/reconcile.ts`](server/src/registry/reconcile.ts) is
+the diff, a pure function over records and containers.
+[`startup.ts`](server/src/startup.ts) sequences the two and is what `index.ts`
+now calls.
+
+**The one real deviation: the Podman socket work moved up from phase 2.** You
+cannot list containers carrying a label without something that talks to a
+runtime, and phase 1's done-when is specifically about status accuracy. So
+[`container/runtime.ts`](server/src/container/runtime.ts) declares the narrow
+interface reconciliation needs — `list(labelKey)`, nothing else — and
+[`container/podman.ts`](server/src/container/podman.ts) implements it over the
+REST socket. Phase 2 widens the interface to `create`/`start`/`stop`/`remove`/
+`inspect` rather than inventing it. This front-loads the schedule risk named at
+the bottom of this file, which turned out to be about half an hour rather than
+the hour budgeted; the `node:http` `socketPath` gotcha is now in AGENTS.md.
+
+Smaller decisions worth knowing:
+
+- **A running container reads as `starting`, not `ready`.** `ready` means
+  OpenCode inside it answered, and nothing at startup has spoken to OpenCode.
+- **`missing` joined `WorkspaceStatus`** — registered, but the container is
+  gone. It exists because drift is reported rather than healed, so "gone" has to
+  be something Yammer can hold and say.
+- **A removed container does not remove the record.** The host directory still
+  holds the user's work.
+- **An unreachable container runtime is a warning, not a fatal.** v1's workspace
+  is an `opencode serve` started outside Yammer, so a machine with no
+  `podman.socket` still runs Yammer fine — it just cannot verify statuses. That
+  becomes fatal in phase 2, when the runtime is load-bearing.
+- **A name in both the registry and `YAMMER_PROJECT_DIR` is a hard error**, not
+  a precedence rule: silently shadowing one with the other would make `load` do
+  something other than what the name says.
+- New config: `YAMMER_STATE_DIR`, `YAMMER_PODMAN_SOCKET`. New dependency:
+  `env-paths`, the only one this plan adds.
+
+**Verified:** 123/123 tests (30 new), clean typecheck, and 13 live checks
+against real Podman 6.0.2 — a real labelled container created, listed through
+the real socket, reconciled, then `podman rm -f`'d out from under Yammer and
+reconciled again to `missing` with the corrected status written back to disk.
+The hand-edited-into-nonsense case fails at startup with:
+
+```
+the workspace registry at /…/workspaces.json is malformed:
+workspace "x": `containerId` must be a non-empty string
+```
+
+Also done here, since it was outstanding from phase 0: **a real end-to-end voice
+turn.** Kokoro synthesized the utterance, it went through real Groq STT
+(transcript exact), the real routing model (2.0s), a real OpenCode turn (4.4s),
+and came back as 14.8s of speech — `turn.end outcome=forwarded`, 13.4s to first
+audio.
+
+---
+
+## Phase 2 — container lifecycle ✅
+
+The first genuinely new subsystem. Everything here sits behind one interface so
+that the lifecycle state machine is testable without a container runtime.
+
+- Widen the `ContainerRuntime` interface phase 1 introduced — it has `list`
+  today — to `create`, `start`, `stop`, `remove`, `inspect`, and add a fake for
+  tests. This mirrors how `ws-server.test.ts` already fakes its four network
+  dependencies, so the pattern is established rather than invented.
+- The transport is already there:
+  [`container/podman.ts`](server/src/container/podman.ts) talks to the REST
+  socket over `node:http`. The two things that cost time — `fetch` not doing
+  Unix sockets, and `all=true` — are settled and recorded in AGENTS.md.
+- **An unreachable runtime becomes fatal in this phase.** Phase 1 treats it as a
+  warning because v1's workspace needs no container; from here Yammer cannot do
+  its job without one.
+- Port allocation: bind `127.0.0.1:<port>:4096` per workspace, record the port
+  in the registry, and handle the allocation race by letting the OS pick and
+  reading it back rather than by scanning for a free port first.
+- Per-workspace OpenCode state gets its own volume. Provider credentials mount
+  read-only. The shared `~/.local/share/opencode` mount in
+  [`quadlet/yammer-opencode.container`](quadlet/yammer-opencode.container) must
+  not survive into the template — its own comment already warns about
+  concurrent sqlite writers, and N workspaces makes that the normal case.
+- The agent file bind-mounts read-only from a Yammer-owned host path.
+- Readiness: poll the container's OpenCode until it answers, with a timeout that
+  produces its own distinct spoken error. The doc requires spoken feedback
+  during `starting`; the supervisor already establishes the pattern of speaking
+  mid-turn, so this reuses it rather than needing new protocol.
+
+  This is the edge that phase 1 deliberately left missing: reconciliation calls
+  a running container `starting`, and nothing else promotes it, so `ready` is
+  currently unreachable for a persisted workspace — and
+  [`index.ts`](server/src/index.ts) only watches permissions for `ready` ones.
+
+  **The probe is `app.agents()`**, i.e. the existing
+  [`verifyAgent`](server/src/opencode/client.ts). OpenCode publishes no health
+  endpoint — its `app` namespace is `log` and `agents`, nothing else — so
+  readiness has to be a real request, and this one distinguishes three states
+  that a TCP-level check collapses into one:
+
+  - connection refused — the container is up but OpenCode has not bound the port
+    yet. Retryable, and the common case.
+  - answers, agent present → `ready`.
+  - answers, agent absent → `failed` immediately, no further polling. Retrying
+    cannot fix it: OpenCode reads `.opencode/agent/*.md` once at boot and never
+    hot-reloads, so an agent file that was not visible when the container's
+    OpenCode started never will be. That is exactly the bind-mount-went-wrong
+    case this phase introduces, and `verifyAgent`'s own comment already notes it
+    is otherwise invisible until the first forwarded turn — where it surfaces as
+    an unshaped reply mid-conversation instead of an error at creation time.
+
+  So readiness and agent verification are one call, and this phase merges them
+  rather than polling and then verifying.
+
+  Poll on `create` and `load`, where the user is waiting and can be spoken to.
+  Startup additionally does one bounded, parallel, non-blocking pass over
+  containers found running, so that `list` does not report `starting` for a
+  workspace that has been up for a week; that pass must never delay `listening`.
+
+  A timeout leaves the workspace `failed`, not `starting` — otherwise the next
+  `load` starts polling a container that has already established it will not
+  answer. Budget the timeout against a measured cold OpenCode boot in a fresh
+  container rather than a guessed number.
+
+**Done when:** the lifecycle state machine has tests against the fake runtime
+covering each of `load`'s failure points, and a real create/load/delete cycle
+works by hand against Podman.
+
+**Watch for:** the OpenCode image is Arch + `pacman -Syu` at build time.
+Creating a workspace must not rebuild it. Decide the image refresh story
+explicitly — a stale pinned image is a better default than a workspace creation
+that takes four minutes.
+
+### What landed
+
+[`lifecycle.ts`](server/src/lifecycle.ts) holds the four verbs;
+[`container/runtime.ts`](server/src/container/runtime.ts) grew `create`,
+`start`, `stop`, `remove` and `inspect`;
+[`container/podman.ts`](server/src/container/podman.ts) implements them and
+[`container/fake.ts`](server/src/container/fake.ts) is the in-memory equivalent
+the tests run against. `WorkspaceLifecycleError` carries a `kind`, which is how
+each of `load`'s failure points keeps its own spoken error in phase 3 — the
+module itself says nothing aloud.
+
+**Image refresh, decided:** a pinned image, never built on demand. `create`
+against a missing image is an `image-missing` error naming the `podman build`
+command. Rebuilding inside `create` would make "make me a workspace" a
+four-minute wait on an Arch mirror, and a stale image is the better failure.
+
+Decisions worth knowing:
+
+- **Ports are allocated by asking for `host_port: 0`**, not by scanning. Podman
+  assigns it at *create* time, so `inspect` reads it back before the container
+  has run and the registry records it immediately. A port that later disagrees
+  with the record is `port-drift` and refuses to load, because the client's base
+  URL is already built and carrying on would mean prompting whatever else now
+  answers there.
+- **Credentials mount read-only inside the read-write per-workspace state
+  mount.** Podman orders nested mounts by depth, so this works; it is verified
+  live rather than assumed, in both directions (the state dir is writable, and
+  `auth.json` is not).
+- **`create` leaves the workspace stopped.** The doc's lifecycle has a
+  "created, stopped" state, and a create that also waited for readiness would
+  have two failure sets in one operation.
+- **`delete` will not remove a directory outside `YAMMER_WORKSPACE_ROOT`.**
+  `workDir` comes off a file a person can edit, and the function ends in a
+  recursive delete.
+- **Startup got a non-blocking status refresh**, after `listen` and deliberately
+  not awaited: reconciliation can only say a container is up, so without it a
+  workspace running for a week still reads `starting`.
+- New config: `YAMMER_OPENCODE_IMAGE`, `YAMMER_WORKSPACE_ROOT`,
+  `YAMMER_AGENT_FILE`, `YAMMER_OPENCODE_AUTH`,
+  `YAMMER_WORKSPACE_READY_SECONDS`, `YAMMER_WORKSPACE_STOP_SECONDS`. No new
+  dependencies.
+
+**One thing the plan got wrong**, found by running it rather than by reading it:
+a rootless published port is bound by Podman's port forwarder before OpenCode is
+listening behind it, so a probe during that window is *accepted and then never
+answered*. `fetch` has no default timeout, so the first live `load` hung
+indefinitely with nothing in the log after "waiting for OpenCode" — the
+readiness deadline never got a chance to fire, because the loop never got back
+to checking it. `probeAgent` now takes a bounded `AbortSignal.timeout`, and
+[`opencode/client.test.ts`](server/src/opencode/client.test.ts) reproduces the
+hang against a socket that accepts and stays silent.
+
+**Verified:** 154/154 tests (31 new), clean typecheck, and 28 live checks
+against real Podman 6.0.2 covering the whole cycle — create, the four mounts,
+readiness, stop, load again, a rejected duplicate name, delete, and `load` on a
+deleted workspace. A cold container answers in about 2s; `load` returns ready in
+about 7s, the difference being one bounded probe against that startup window.
+
+---
+
+## Phase 3 — meta-commands and router arguments ✅
+
+- Broaden `MetaCommand.run`. Today it takes a `SessionController`
+  ([`commands.ts`](server/src/router/commands.ts)); it needs a context carrying
+  the registry, the [`WorkspaceManager`](server/src/lifecycle.ts), and the
+  active workspace's session where one applies.
+- Add `create`, `load`, `list`, `delete`. The machinery exists — this phase is
+  the voice on top of it, which means mapping each `WorkspaceLifecycleError`
+  kind to its own spoken sentence, speaking during `starting` (~7s, measured),
+  and putting `delete` behind the supervisor. **`load` does not create** — an
+  unknown name is a spoken error. This is the single most important behavioral
+  detail in the phase: `load` reaches Yammer as a routing model's reading of a
+  Whisper transcript, and create-on-miss turns every mishearing into a junk
+  container.
+- Router schema gains a workspace-name slot. Name resolution is normalised
+  matching against the registry (case, spacing, hyphenation) — phase 2's
+  `sanitizeWorkspaceName` is that normalisation and already lands "Space Game"
+  and "space game" on one workspace. A miss is an error rather than a
+  nearest-neighbour guess.
+- **Re-run `npm run eval:router`.** Two independent reasons, either sufficient:
+  the schema is changing from a closed enum to an enum plus free text, and
+  AGENTS.md already records a model that did not reliably honour strict
+  `json_schema`; and the critical-misroute class now includes workspace delete,
+  which is more destructive than the `new_session` false positive that set the
+  current default model. Add workspace cases to
+  [`cases.ts`](server/src/router/eval/cases.ts) before running it, not after.
+
+**Done when:** the eval passes with no critical misroutes on the expanded case
+set, and creating, loading, listing, and deleting a workspace all work by voice.
+
+### What landed
+
+[`commands.ts`](server/src/router/commands.ts) grew a `CommandContext` (the
+session, the registry, the manager, this client's active workspace, the
+extracted name, and two capabilities — `say` for speaking mid-command and
+`confirm` for the spoken gate) and the four verbs on top of it. The router's
+schema gained a `workspace` slot, filled only for the commands that declare
+`takesWorkspace`.
+
+**The supervisor gained `confirm`, which phase 5 was going to introduce.** The
+plan had `delete` behind the supervisor in this phase and the supervisor's
+source-agnostic rework in the next one, which cannot both be true. So `confirm`
+reuses the answer window, the keyword matcher and the second voice while
+staying separate from `handle`: it has no OpenCode request to reply to and no
+pattern for "always" to widen to. Phase 5 still merges them; what it no longer
+has to do is *introduce* the gate, and `delete` is not left ungated in the
+meantime.
+
+Decisions worth knowing:
+
+- **Names resolve on a key with every separator stripped**, not on the
+  hyphenated sanitized name. This is the one thing the live run changed:
+  Whisper returned "LiveCheck" when the workspace was created and "live check"
+  when it was loaded, so `create` made `livecheck` and `load` could not find
+  it. `create` now also refuses a name that only *sounds* like an existing one.
+- **`load` speaks only when there is a wait**, and moves the client last —
+  a failed load leaves it where it was rather than in a workspace it cannot
+  talk to.
+- **A denied `delete` returns no sentence at all.** The supervisor has already
+  said what it did; a second "left it alone" is worse than one.
+- **Workspace errors still ride the `internal` wire code.** The sentence is
+  what carries the difference and the client plays one earcon regardless;
+  phase 4's protocol bump is where they get codes of their own.
+- **One extra router call on a malformed answer.** See below.
+- No new config, no new dependencies.
+
+**What the eval found, which is what it is for:** the schema going from two
+fields to three made `deepseek/deepseek-v4-flash` return prose instead of JSON
+in ~3% of calls — the same strict-mode failure AGENTS.md already records for
+the `-latest` alias, now reproducing on the dated model. It scored 70/73 with
+two such errors. `Router.route` now asks exactly once more when an answer is
+unusable (malformed only — not transport failures, not non-2xx), which took it
+to **73/73 with no critical misroutes**. `google/gemini-2.5-flash-lite` scored
+72/73 and is five times faster, but still misroutes "make it new" to
+`new_session` — the same critical failure that chose the current default, so
+the default stands.
+
+**Verified:** 177/177 tests (23 new), clean typecheck, and 21 live checks
+driving the real server over a real socket — utterances synthesized with
+Kokoro, sent as ordinary audio frames through real Groq STT, the real routing
+model, real Podman, with the *replies transcribed back* so the assertions are
+on what the user would hear. Create, list, load, an unknown name, a denied
+delete, and an approved delete, all by voice. The retry fired twice during
+those six turns and recovered both.
+
+---
+
+## Phase 4 — multi-client and protocol v3 ✅
+
+- Drop the `4004` single-client close. Per-client state is already
+  per-connection after phase 0; the active workspace joins it.
+- **Busy stays per-connection.** A person cannot say two things at once, so
+  `turn.rejected {reason: "busy"}` keeps its meaning for one client. Two clients
+  sharing a workspace is supported and unlocked, per the doc's concurrency
+  section — verified against a live OpenCode, two concurrent sessions in one
+  directory with ~18s of real overlap and a consistent resulting tree.
+- Protocol bump to 3: `4004` retired, new error codes (`workspace_unknown`,
+  `workspace_start_failed`, and whatever phase 2's failure points need).
+- The client learns nothing about workspaces. It has no screen; the user finds
+  out which workspace they are in by hearing it.
+- Per AGENTS.md, [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md),
+  `server/src/protocol.ts`, and `client/src/yammer_client/protocol.py` change
+  together, and the dumped frame fixture gets regenerated:
+  `cd client && .venv/bin/python tools/dump_protocol_frames.py`.
+
+**Done when:** two clients hold sessions in different workspaces simultaneously
+without interfering, `protocol.test.ts` passes against regenerated fixtures, and
+`ws-server.test.ts` covers the two-client case.
+
+### What landed
+
+Mostly the absence of a gate. `startServer` no longer closes the second
+connection, and everything that had to be per client already was — phase 0's
+per-connection `TurnManager` and `ClientWorkspaces`, phase 3's per-client
+active workspace. The protocol went to **3**: `4004` retired and deliberately
+not reused, so an old client meets a version mismatch rather than a close code
+that has quietly changed meaning. Three error codes joined it —
+`workspace_unknown`, `workspace_start_failed`, `workspace_failed` — split by
+what the user would do about each, with the spoken sentence still finer-grained
+than the code. PROTOCOL.md, `protocol.ts` and `protocol.py` changed together
+and the frame fixture was regenerated, as the repo requires.
+
+Two smaller things worth knowing:
+
+- **PROTOCOL.md now requires clients to tolerate an unrecognised error code.**
+  Codes are expected to grow; making each one a version bump would mean the
+  client and server cannot be updated independently for something the client
+  does not branch on anyway.
+- **v1's "one user, one project, one client at a time" assumption is now
+  annotated in [`voice-opencode-requirements.md`](voice-opencode-requirements.md)**
+  rather than left contradicting the code. That doc's own preamble says
+  changing an operating assumption invalidates parts of the design, so the
+  parts that survive are named.
+
+**What the tests found, which is what they are for:** two bugs, both in the
+test harness, both invisible until two clients existed. `once(socket, "open")`
+on an already-open socket waits forever — Node reports that as "Promise
+resolution is still pending but the event loop has already resolved", which
+points nowhere near the cause. And a test that asserted on `permission.ask`
+without answering it left the supervisor's answer window open, holding the
+process alive for 24 seconds with every test passing. Both are in AGENTS.md.
+
+**Verified:** 182/182 tests (5 new, all multi-client), clean typecheck,
+`protocol.test.ts` green against the regenerated fixture, and 17 live checks
+with **two real clients against one real server**: both handshaking at proto 3,
+creating a workspace each concurrently, loading both at once (two cold
+containers ready in ~19s), each hearing itself in its own workspace and neither
+moved by the other, and each opening a real OpenCode session inside its own
+container. No prompt was forwarded, so that cost no model tokens.
+
+---
+
+## Phase 5 — supervisor generalization and permission policy ✅
+
+- **Make the supervisor source-agnostic.** It currently takes an OpenCode
+  `PermissionRequest` — id, permission name, patterns, an `always` field. A
+  workspace delete has none of those. Introduce an approval-request abstraction
+  (spoken description, whether "always" is even offered, a settle callback),
+  with OpenCode permissions as one implementation and Yammer's own destructive
+  meta-commands as another.
+- Route workspace `delete` through it.
+- Rework the agent's permission rules for the sandbox framing. Most of the
+  current ask-list becomes `allow` — `git push` in particular needs no gate,
+  because with no credentials in the container it simply fails. What stays is
+  the short bind-mount sanity list: wholesale deletion and history-destroying
+  resets, the "don't delete everything" class. Keep it short enough that a ~10s
+  voice round trip stays rare.
+- Grounding: any summarization the supervisor speaks must come from Yammer's own
+  observation of the host-side directory (a real `git diff`), never from the
+  container's description of itself. This is why workspace directories are
+  Yammer-owned bind mounts in the first place.
+
+**Done when:** `keywords.test.ts` still passes, a workspace delete prompts and
+settles by voice, and a denied delete leaves the workspace intact.
+
+### What landed
+
+[`supervisor/approval.ts`](server/src/supervisor/approval.ts) is the abstraction:
+an `ApprovalRequest` is a description, an optional pattern that "always" would
+widen to, an optional directory whose contents are at stake, and a `settle`.
+`agentApproval` and `yammerApproval` are the two adapters, and
+`PermissionSupervisor.handle` and `.confirm` collapsed into one `approve()` that
+never branches on where a request came from. Phase 3's `confirm` was the second
+implementation this merges, exactly as planned.
+
+[`git.ts`](server/src/git.ts) is the grounding: real `git status` and a real
+count of commits on no remote, run by Yammer against the host-side directory,
+turned into one clause. The agent's ask-list was rewritten for the sandbox
+framing — thirteen entries down to seven, all of them the "don't delete
+everything" class.
+
+Decisions worth knowing:
+
+- **Every sentence the supervisor says now comes from `speech.ts`, including
+  the answer menu.** A caller used to pass a whole question, which meant
+  `delete` spelled out "say approve or deny" itself. One place decides which
+  answers are on offer, so a request with nothing to remember cannot invite an
+  "always" — and a heard "always" there settles as `once`, because reporting
+  `always` would tell the user they had configured something that does not
+  exist.
+- **Agent requests always carry the workspace directory**, rather than a second
+  list deciding which commands deserve a grounded clause. The ask-list *is* the
+  work-destroying list now, so a predicate over it would be the same list
+  written twice, and drift between them would be silent.
+- **The stakes clause is scoped.** Unpushed commits are spoken only when the
+  directory itself is going; a `reset --hard` leaves the history alone and
+  saying otherwise is noise at the one prompt that must stay worth hearing.
+  Nothing is said at all when nothing is at stake.
+- **Pushes, publishes and releases came *off* the ask-list.** There are no
+  credentials in the container, so they fail on their own; gating them spends a
+  ~10s spoken round trip to authorise an error. What stayed is recursive and
+  forced `rm`, `git reset --hard`, `clean`, `checkout --`, `restore`, and
+  `branch -D`.
+- **`git.ts` fails soft, every way it can.** No git, no directory, a repository
+  with no commits — each produces a shorter question, never a failed prompt.
+- No new config, no new dependencies.
+
+**What the live run found, which is what it is for:** a race the tests could not
+see, because they never aborted a real in-flight prompt. `settle` recorded the
+refusal *after* acting on it — but acting on it stops the agent, which makes the
+blocked `prompt()` fail immediately, and `TurnManager` reads `wasDenied()` the
+moment that happens. So a refused tool call ended the turn as `error`, saying
+"OpenCode returned an empty response": the user is told the system broke rather
+than that they said no. The flag is now set before settling, `ws-server.test.ts`
+has a fast reproduction (it fails against the previous ordering), and the
+gotcha is in AGENTS.md. The live run also caught "1 commit that aren't on any
+remote", which no test noticed because no test listened to it.
+
+**Verified:** 222/222 tests (36 new: 15 in `git.test.ts` against real
+repositories in temporary directories, 17 in `supervisor/approval.test.ts`, four
+more in the command and socket suites), a clean typecheck, and the live voice
+run described under the cleanup below — run after it, so that it exercised the
+final wiring rather than a state that lasted one commit.
+
+---
+
+## Cleanup, once phase 2 lands ✅
+
+Yammer no longer runs in a container, so these describe something that no longer
+exists and should go rather than rot:
+
+- `containers/yammer-server/Containerfile`
+- `quadlet/yammer-server.container` and `yammer-server.build`
+- `quadlet/yammer.network` — containers never need to reach each other, and
+  Yammer reaches them on published loopback ports.
+- `quadlet/yammer-opencode.container` stops being a unit and becomes the
+  template Yammer applies per workspace.
+
+`YAMMER_PROJECT_DIR` and `YAMMER_OPENCODE_URL` stop being meaningful as single
+values and are replaced by a workspace root directory, image name, runtime
+socket path, and readiness timeout. Per the repo's own convention, each goes in
+the config module, the README table, and `.env.example` together.
+
+### What landed
+
+**The whole `quadlet/` directory went, not just the four files.** The workspace
+"template" the last bullet asks for already exists — it is `lifecycle.ts` plus
+`container/podman.ts`, which build the container over the REST socket — so
+keeping a unit file of the same mounts would have been a second copy of it, in a
+format nothing reads. The one thing in there still worth having was how to build
+the image, and `server/README.md` already documented that `podman build`. Yammer
+itself has no service unit yet; it is started by hand, and that is noted in
+`todo.txt` rather than invented here.
+
+**The config-derived workspace went with them**, which is the part with real
+behaviour attached. `YAMMER_PROJECT_DIR` and `YAMMER_OPENCODE_URL` are gone from
+the config, the README table and `.env.example`; `workspaceFromConfig` is gone;
+`WorkspaceRegistry` no longer has a `defaultName` and can legitimately be empty.
+Keeping it would have left a workspace in `list` whose OpenCode was the
+`opencode serve` the deleted Quadlet unit used to run — a name that answers on a
+port nothing serves.
+
+Which forced the question the plan did not ask: **what workspace is a client in
+when it connects?** The answer is none, and it says so.
+
+- A connection starts in no workspace and enters one by saying `load`. With
+  several workspaces, any default is a guess about which project an utterance
+  meant, made by the side of the system with no screen to show the guess. The
+  cost is one utterance per connection; the alternative is forwarding "fix the
+  parser bug" into whichever project sorted first.
+- Speaking before entering one is an error with its own code — `no_workspace`,
+  the fourth workspace code — and a sentence that names the way out. **The
+  protocol stays at 3**: PROTOCOL.md already requires clients to tolerate an
+  unrecognised code, which is exactly what that rule was written for, and the
+  client branches on none of them.
+- A workspace deleted underneath a client leaves it nowhere rather than
+  somewhere. The old fallback-to-default was the only sensible answer while a
+  default existed; without one, "nowhere" is also the more honest one.
+- The session is resolved late, at the point a turn actually needs OpenCode, so
+  `create`, `load` and `list` still work for a client that has nowhere to talk
+  yet. `list` says "you're not in one right now", because which one you are in
+  is half of what that command is for.
+
+The socket tests grew a `TestClient.enter()` that runs a real `load` turn, since
+a test that forwards now has to say where first. That is more setup per test and
+also more honest: the connect-then-load flow is what a real client does.
+
+**Verified:** 222/222 tests, clean typecheck, `protocol.test.ts` green against
+the unchanged fixture (the Python client enumerates no error codes, so there was
+nothing to regenerate), and the live run below.
+
+### The live run, covering both
+
+**26 checks, 26 passed**, against the real stack: utterances synthesized with
+Kokoro, sent as ordinary audio frames through real Groq STT, the real routing
+model and real Podman, with every reply *transcribed back*, so the assertions
+are on what a person would hear. In order:
+
+- A client that has said nothing about workspaces asks a question and is told
+  "You're not in a workspace yet. Say load and the name to enter one, or list
+  workspaces to hear what there is." — `no_workspace`, nothing forwarded.
+- "Create a workspace called Space Game" → a real container, and "Created space
+  game. It's empty and stopped. Say load space game to start it."
+- "Load Space Game" → "Starting up space game, one sec." then, 13 seconds later,
+  "You're in space game."
+- A real `git init`, one commit, one modified file and two untracked ones put in
+  the workspace directory on the host.
+- "Delete the Space Game workspace" → **"This deletes the space game workspace
+  and everything in its directory, and it cannot be undone. There are
+  uncommitted changes in 1 file, 2 untracked files, and 1 commit that isn't on
+  any remote. Say approve or deny."** Every number in that sentence came from
+  Yammer running git against the directory a second earlier. A spoken "deny"
+  settles it as `reject`, the workspace and its directory survive.
+- The same again, answered "approve": deleted, directory gone, and the client
+  that was in it lands *nowhere* rather than somewhere else — the next utterance
+  gets `no_workspace` again.
+
+The agent-sourced half was verified in an earlier run of the same script rather
+than the final one: prompted to `rm -rf` a directory, the container's OpenCode
+asked, and the supervisor said **"The agent wants to run rm flag r f slash
+workspace slash notes and then ls flag l a slash workspace. Saying always allows
+anything matching rm star from now on. There are uncommitted changes in 1 file
+and 2 untracked files. Say approve, always, or deny."** — the merged path, the
+widened `always`, the grounded clause, and history correctly left out of a
+working-tree action. That run is also where the refusal-ordering race surfaced.
+On the final run the model simply did not reach a gated command inside the
+timeout, which is model variance rather than a result; the deterministic
+coverage of that path is in `ws-server.test.ts`.
+
+## Risks worth naming
+
+- ~~**Router argument extraction is the highest-variance piece.**~~ Retired,
+  and it was the right thing to have named: the wider schema did degrade strict
+  JSON mode, in exactly the recorded way, at a rate high enough to lose turns.
+  The eval caught it, a single retry on a malformed answer fixed it, and the
+  extraction itself was never the problem — 13/13 workspace cases and 10/10
+  workspace-adversarial on the first run.
+- ~~**The Podman socket work is the likeliest schedule surprise.**~~ Retired in
+  full. `list` landed in phase 1 in about half an hour; `create` with mounts,
+  labels and a published port landed in phase 2 and was not where the trouble
+  was. The trouble was on the *other* side of the socket — see phase 2's note on
+  the port that accepts before anything is listening.
+- **Container start latency is new user-facing latency.** Measured in phase 2:
+  a cold container answers in ~2s, and `load` returns ready in ~7s. That is
+  short enough that the spoken "one sec" covers it and long enough that it must
+  be spoken. Phase 3 is where that sentence gets said.
+- ~~**Disk.**~~ Largely retired. `delete` reclaims the container, the working
+  directory and the per-workspace OpenCode state, verified live. What remains is
+  ordinary: N working copies is N working copies, and nothing warns about it.

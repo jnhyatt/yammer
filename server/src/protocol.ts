@@ -6,14 +6,20 @@
  * type definition.
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
-/** Application-specific WebSocket close codes. */
+/**
+ * Application-specific WebSocket close codes.
+ *
+ * `4004 ALREADY_CONNECTED` was retired in v3. Several clients may connect at
+ * once, each with its own active workspace and its own turn — the number is
+ * left unused rather than recycled, so an old client meeting a new server gets
+ * a version mismatch rather than a close code that has changed meaning.
+ */
 export const CloseCode = {
   AUTH_FAILED: 4001,
   UNSUPPORTED_PROTOCOL: 4002,
   PROTOCOL_VIOLATION: 4003,
-  ALREADY_CONNECTED: 4004,
 } as const;
 
 export interface AudioFormat {
@@ -61,6 +67,14 @@ export type SpeechVoice = "agent" | "supervisor";
  */
 export type PermissionResponse = "once" | "always" | "reject" | "timeout";
 
+/**
+ * The three workspace codes split by what the user would do about it, not by
+ * which function threw: an unknown name is something they said, a failed start
+ * is something to go and look at, and the rest is a setup problem. The spoken
+ * sentence is finer-grained than this — there is one per `LifecycleFailure` —
+ * because the code exists for the client's earcon and the log, and the
+ * sentence exists for the person.
+ */
 export type ErrorCode =
   | "stt_failed"
   | "stt_empty"
@@ -69,6 +83,14 @@ export type ErrorCode =
   | "opencode_error"
   | "tts_failed"
   | "supervisor_failed"
+  /** The client is not in a workspace and said something that needs one. */
+  | "no_workspace"
+  /** No workspace of that name. Never an implicit create. */
+  | "workspace_unknown"
+  /** It exists, and it did not come up: container, port, or OpenCode itself. */
+  | "workspace_start_failed"
+  /** Anything else about a workspace command — a name clash, a missing image. */
+  | "workspace_failed"
   | "internal";
 
 // --- Client → Server -------------------------------------------------------

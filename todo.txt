@@ -1,0 +1,70 @@
+Loose ends, in no particular order.
+
+## Revisit the routing model
+
+Yammer's router is `deepseek/deepseek-v4-flash` (server/src/config.ts,
+YAMMER_ROUTER_MODEL). It got there by being the only model that did not misroute
+"make it new" onto `new_session`, which wipes a conversation. That was one
+adversarial case; it is worth re-deciding on wider evidence.
+
+Where it stands after the phase 3 eval (`npm run eval:router`, 73 cases):
+
+- deepseek/deepseek-v4-flash: 73/73, no critical misroutes, but only with the
+  single retry Router.route now does on a malformed answer. Without it, 70/73 —
+  it returned prose instead of JSON in ~3% of calls once the schema went from
+  two fields to three. Slowest of the three by a lot.
+- google/gemini-2.5-flash-lite: 72/73, ~5x faster, no JSON-mode failures
+  observed. Its one miss is "make it new" -> new_session, i.e. exactly the
+  destructive misroute that chose the incumbent.
+
+So the choice today is "slow and occasionally malformed" against "fast and
+occasionally destructive", and both were judged on one run each.
+
+Worth doing:
+
+- Run each candidate several times over the whole case set rather than once.
+  One run cannot distinguish a 1-in-73 model from a 1-in-10 model, and the
+  destructive class is exactly where that difference matters.
+- Weight the score. A critical misroute is not one point; losing a session or a
+  workspace is worse than any number of "forward"s that should have been
+  meta-commands. The eval already separates the two — the summary should stop
+  presenting them as one number.
+- Measure the retry's cost. It doubles latency on the calls that need it, and
+  the malformed rate is the thing that decides whether the incumbent's speed
+  penalty is one call or two.
+- Try more of the field, not just these two: gemini-2.5-flash (not lite),
+  qwen3-next-80b-instruct, glm-4.6-air, mistral-small-2506, and whatever
+  cheap-and-fast models exist by the time this is picked up. Also worth trying
+  the same model with a shorter prompt — the router prompt has grown with every
+  meta-command and some of the misroutes may be prompt length, not model.
+- Consider dropping strict json_schema for a plain JSON instruction plus the
+  parser Yammer already has. Strict mode has now failed on two different models
+  and the parse path is defensive anyway.
+
+Do not change the default without adding the failing case to
+server/src/router/eval/cases.ts first. That file is the only record of why the
+current model was chosen.
+
+## Deployment
+
+The quadlet/ directory is gone: it described two systemd units for a server
+that now runs on the host and an OpenCode that Yammer starts itself. Nothing
+replaced it.
+
+- Yammer runs uncontainerized and has no service unit of its own. It is started
+  by hand. A single user unit plus `loginctl enable-linger` is probably all it
+  needs, but it is deliberately not written yet.
+- The workspace image is built by hand, once:
+  `podman build -t localhost/yammer-opencode:latest -f containers/yammer-opencode/Containerfile .`
+  It is Arch plus `pacman -Syu`, so it goes stale silently. There is no refresh
+  story beyond rebuilding it, on purpose — a `create` that rebuilt would be a
+  four-minute wait on a mirror.
+- `localhost/yammer-server:latest` may still be in the local image store from
+  the deleted Containerfile. Nothing uses it.
+
+## Smaller things
+
+- The Android client has never spoken protocol 3 to this server. The
+  conformance test covers the frames; a real handset does not.
+- Nothing warns about disk. N workspaces is N working copies plus N container
+  images' worth of OpenCode state.

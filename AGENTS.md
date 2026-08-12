@@ -49,10 +49,11 @@ android/models/        the five .onnx files, checked in, digests pinned by the f
 android/tools/         desktop scripts for what the phone cannot judge about itself
 fixtures/              language-neutral test data every implementation is checked against — see fixtures/README.md
 .opencode/agent/       the TTS-aware OpenCode agent every turn is prompted with
-containers/            Containerfiles for the server and OpenCode images
-quadlet/               Podman Quadlet units to run both as systemd services — see quadlet/README.md
+containers/            the Containerfile for the workspace image Yammer runs
 voice-opencode-requirements.md   scope and design decisions
 android-client-plan.md           the Android client's implementation plan (§9 of the above)
+yammer-server-v2.md              per-project OpenCode containers: scope and design decisions
+yammer-server-v2-plan.md         how and in what order that gets built, and how far it has got
 ```
 
 Each half has a gitignored `.env` and a checked-in `.env.example`. `YAMMER_TOKEN`
@@ -112,7 +113,7 @@ Config comes from the environment, with a `.env` loaded at startup — first fil
 found wins, files are never merged, and the real environment always beats the
 file. Both READMEs document the search order.
 
-`npm test` (server) runs three suites. What they have in common is that all three
+`npm test` (server) runs ten suites. What they have in common is that all ten
 guard failures that are **silent** — everything else here fails loudly, since a
 bad model id 404s and a protocol mismatch closes the socket.
 
@@ -121,11 +122,40 @@ bad model id 404s and a protocol mismatch closes the socket.
 - `protocol.test.ts` — cross-language codec conformance. The frames are dumped
   from the real Python client module (see above), so this genuinely checks two
   implementations against each other rather than checking JSON round-trips.
-- `ws-server.test.ts` — handshake, close codes, busy rejection, and the error
-  path, driving the real `startServer` with the four network dependencies faked.
-  Its load-bearing assertion is the invariant below: **every turn exit path
-  emits `turn.end`.** A path that skips it strands the client with no way back
-  to idle.
+- `ws-server.test.ts` — handshake, close codes, busy rejection, multi-client
+  isolation, and the error path, driving the real `startServer` with the four
+  network dependencies faked. Its load-bearing assertion is the invariant below:
+  **every turn exit path emits `turn.end`.** A path that skips it strands the
+  client with no way back to idle. The two-client cases guard the same shape of
+  failure one level up: state that looks per-client and is not answers one
+  person out of another person's project, with nothing thrown anywhere.
+- `registry/store.test.ts` — the workspace registry's parser. A file edited by
+  hand into something slightly wrong must fail at startup naming the field; a
+  parser that shrugs drops a workspace out of `list` while its directory, and
+  the user's work in it, sit there untouched.
+- `registry/reconcile.test.ts` — registry vs. the containers that actually
+  exist. A workspace reported `ready` whose container was removed weeks ago
+  sends the next `load` into a timeout with no explanation.
+- `lifecycle.test.ts` — create/load/stop/delete against `container/fake.ts`.
+  `load` has several distinct failure points and the requirements doc asks each
+  to produce its own spoken error; two of them collapsing into one message is
+  invisible until someone is standing there being told the wrong thing.
+- `opencode/client.test.ts` — one test, for one hang observed against a real
+  container. See the readiness-probe gotcha below.
+- `router/commands.test.ts` — the workspace commands' spoken half. Two failure
+  kinds reading out identically, a `load` that creates on a mishearing, and a
+  `delete` that runs without a spoken yes are all invisible to a typechecker
+  and expensive in exactly one place: out loud, to someone who can't see a
+  screen.
+- `supervisor/approval.test.ts` — the other half of that conversation: what the
+  user was asked, and what the answer does. An approval that offers "always"
+  when nothing can be remembered, or reports `always` when nothing was, leaves
+  the user believing they configured something that does not exist.
+- `git.test.ts` — what Yammer says is in a directory, checked against real git
+  in real temporary repositories. Faking git here would only prove this module
+  agrees with someone's memory of porcelain output, which is the thing that
+  would be wrong. A prompt that says nothing is at stake while a week of
+  uncommitted work sits there is worse than no prompt.
 
 **One thing is still worth promoting into a checked-in test**: the `.env` parser
 parity check. `client/.../env.py` hand-implements Node's `process.loadEnvFile`
@@ -166,8 +196,10 @@ them should produce no diff unless something genuinely changed — see
 `npm run eval:router` (`server/src/router/eval/`) is a different kind of check
 — not correctness, but a live quality/regression eval for whichever model
 `YAMMER_ROUTER_MODEL` points at, run by hand when changing it. Needs
-`YAMMER_ROUTER_API_KEY`; nothing else. Not yet run against live models — see
-gotchas.
+`YAMMER_ROUTER_API_KEY`; nothing else. It is also the control on the router's
+*schema*: adding a slot changes what the model has to produce, so it gets
+re-run when `META_COMMANDS` grows, not only when the model does. Current
+standing: 73/73 for the default model, no critical misroutes.
 
 ## Conventions
 
@@ -191,6 +223,21 @@ gotchas.
   which meant the *real* gate never fired either. If you catch yourself adding a
   rule to the agent's prompt to prevent an action, that belongs in its
   permission rules instead.
+- **The container is the boundary; the ask-list is only about the bind mount.**
+  Almost anything the agent does inside its own sandbox is acceptable, so the
+  agent's `ask` rules are not a tiered classification of shell commands — they
+  are the short "don't delete everything" list, because the working directory is
+  a real host directory and uncommitted work in it is not recoverable by any
+  means. Anything needing credentials (pushes, publishes, releases) is *not* on
+  the list: there are none in the container, so those fail on their own, and
+  gating them would spend a ~10s spoken round trip to authorise an error. Adding
+  an entry means arguing that it destroys unrecoverable work.
+- **Anything the supervisor says about state, it has to have looked at itself.**
+  The approval loop is LLM-free end to end, and a summary that came from the
+  container is a description written by the thing being supervised. `git.ts`
+  runs real `git` against the host-side working directory for exactly this
+  reason — it is why working directories are Yammer-owned bind mounts in the
+  first place. It fails soft: no git, no directory, no sentence.
 - **Every turn exit path emits `turn.end`,** including failures. The client uses
   it to leave the WAITING state — a path that skips it strands the client.
 - Server: no build step. It runs under Node's type stripping, so **no TypeScript
@@ -256,16 +303,56 @@ Notes here should be things that cost someone time.
   had neither problem. Re-run the eval before trusting a new model here; one
   case flipping a 98% score into a critical failure is why category-average
   accuracy alone is not the metric that matters.
+- **`once(socket, "open")` on an already-open socket waits forever.** The test
+  harness did this, and it only bit when a test connected two clients before
+  awaiting either handshake — the second socket had already opened, so the
+  `open` it was waiting for never came again. Node's test runner reports it as
+  "Promise resolution is still pending but the event loop has already
+  resolved", which does not point anywhere near the cause. Check `readyState`
+  first. The same trap applies to any `once` on an event that may have fired.
+- **Record a refusal before acting on it, not after.** Settling a rejected
+  permission stops the agent, which makes its blocked `prompt()` fail *at once*
+  — and `TurnManager` reads `supervisor.wasDenied()` the moment that happens, to
+  tell an expected empty reply from a real OpenCode failure. Setting the flag
+  after settling loses that race and the turn ends `error` with "OpenCode
+  returned an empty response" instead of `denied`, so the user is told the
+  system broke rather than that they said no. Found in a live run, not by a
+  test; `ws-server.test.ts` now has the fast reproduction.
+- **An unanswered permission prompt keeps the process alive for the full
+  timeout.** The supervisor's answer window is a `setTimeout` per attempt, and
+  it reprompts, so a test that asserts on `permission.ask` and then walks away
+  costs `answerSeconds × maxAttempts` of wall clock — 36s at the defaults, with
+  every test still passing. Settle the request.
+- **Whisper decides for itself whether a two-word name is one word.** In one
+  live sitting, "live check" came back as `LiveCheck` when the workspace was
+  created and as `live check` when it was loaded — so the workspace was made as
+  `livecheck` and then not found. Workspace names are therefore resolved on a
+  key with *all* separators stripped (`lifecycle.ts`'s `workspaceMatchKey`),
+  not on the hyphenated sanitized name, and `create` refuses a name that only
+  sounds like an existing one. Anything else that matches a spoken name against
+  stored state needs the same treatment; the sanitized form is for Podman, not
+  for lookups.
+- **`response_format: json_schema` strict mode is a hint, not a guarantee, and
+  it gets flakier as the schema grows.** `deepseek/deepseek-v4-flash` was clean
+  over 50 cases with a two-field schema; adding the `workspace` slot made it
+  return its three fields as YAML-ish prose in ~3% of calls, and the observed
+  rate on real turns was higher still. `Router.route` therefore asks exactly
+  once more when the answer is unusable — malformed only, never a transport
+  error or a non-2xx — which took a 70/73 eval to 73/73. Don't "simplify" it
+  into a general retry: retrying a down provider just doubles the latency
+  before the same failure.
 - **OpenCode does not hot-reload agent files, and the SDK's `session.prompt()`
   is not `POST /session/{id}/prompt`.** Two things that will each waste an hour
   when touching the agent. Config-time files — `.opencode/agent/*.md`,
   `opencode.json`, skills, plugins — are read once when `opencode serve` boots,
-  so an edited agent means nothing until it restarts; `OpenCodeSession.verifyAgent()`
+  so an edited agent means nothing until it restarts; `OpenCodeClient.verifyAgent()`
   exists to turn that into a startup warning instead of a mystery. And when
   poking the API by hand, `session.prompt()` posts to `/session/{id}/message`
   (`prompt_async` is the one at a `/prompt`-shaped path) — the wrong path returns
   the web UI's HTML with a 200, which looks like a JSON parse bug rather than a
-  404. Verify an agent loaded with `curl "http://127.0.0.1:4096/agent?directory=$YAMMER_PROJECT_DIR"`.
+  404. Verify an agent loaded with `curl "http://127.0.0.1:<workspace port>/agent?directory=/workspace"`
+  — the port is in the registry, and `/workspace` is the bind mount every
+  container sees.
 - **The installed `@opencode-ai/sdk` types lie about permissions.** They
   describe a `permission.updated` event and `POST /session/{id}/permissions/
   {permissionID}` with a `title` field. The running server emits
@@ -324,13 +411,41 @@ Notes here should be things that cost someone time.
   interrupt, the window is usually open — and it widens with synthesis latency
   and question length. Found by `ServerConformanceTest`, which waits the
   supervisor out rather than working around it.
+- **Node's `fetch` cannot talk to a Unix socket,** which is how Podman's REST
+  API is reached. There is no option for it on the global `fetch` and undici's
+  is behind a custom dispatcher, so `src/container/podman.ts` uses `node:http`
+  with `socketPath` instead. The URL still needs a host the parser accepts even
+  though the transport ignores it. Also worth knowing before poking at it by
+  hand: `podman ps` and the API disagree about defaults — the API returns only
+  running containers unless you pass `all=true`, so a stopped workspace looks
+  removed rather than stopped. Verify shapes against the live socket:
+  `curl -s --unix-socket $XDG_RUNTIME_DIR/podman/podman.sock
+  'http://d/v5.0.0/libpod/containers/json?all=true'`.
+- **A rootless published port accepts connections before anything is listening
+  behind it.** Podman's port forwarder binds the host port at container start,
+  so during a workspace's first seconds a request is accepted and then simply
+  never answered — not refused. `fetch` has no default timeout, so an unbounded
+  readiness probe waits there indefinitely, and a poll loop whose probe never
+  returns never gets back to checking its own deadline: `load` hangs forever
+  with nothing after "waiting for OpenCode" in the log. `probeAgent` passes
+  `AbortSignal.timeout` for this reason. Observed, not theorised; the
+  reproduction is `opencode/client.test.ts`.
+- **Podman assigns a published port at *create* time, not at start.** Asking for
+  `host_port: 0` and reading it back from `inspect` works before the container
+  has ever run, and the port survives stop/start. That is why the registry can
+  record it at create time.
+- **The workspace container's mounts nest deliberately.** `auth.json` mounts
+  read-only *inside* the read-write per-workspace OpenCode state directory.
+  Podman orders mounts by destination depth, so this works — but it means the
+  two mounts are a pair, and changing one without the other silently gives every
+  workspace either no credentials or a shared sqlite database.
 - **OpenCode's own default model is not guaranteed to work, and the failure
-  only shows up on the first forwarded turn.** `OpenCodeSession.resolveModel`
+  only shows up on the first forwarded turn.** `OpenCodeClient.resolveModel`
   falls back to `client.config.providers()`'s first default when
   `YAMMER_OPENCODE_PROVIDER`/`YAMMER_OPENCODE_MODEL` are unset — that default
   has pointed at a model the account can't actually use. Set both explicitly.
   `opencode/deepseek-v4-flash-free` is verified working end to end (real
-  `OpenCodeSession.prompt()` call, real reply) with no extra credentials and no
+  `OpenCodeClient.prompt()` call, real reply) with no extra credentials and no
   cost. The adjacent-looking `opencode-go`'s paid `deepseek-v4-flash` is a trap
   — same model family, cheap, but **region-locked to China**, 403s "requires
   explicit opt in" on first use. See server/README.md's "OpenCode model"

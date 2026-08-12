@@ -20,6 +20,14 @@ import { META_COMMANDS } from "./commands.ts";
 
 export interface RouteDecision {
   action: "forward" | (string & {});
+  /**
+   * The workspace name the model heard, for the commands that take one.
+   *
+   * Empty for everything else, including a workspace command whose utterance
+   * named nothing — which is a spoken error rather than a default, because the
+   * alternative is deleting whichever workspace happened to be nearest.
+   */
+  workspace: string;
   /** Present when the router explains itself; logged, never spoken. */
   reason?: string;
 }
@@ -31,7 +39,18 @@ export interface SessionState {
   turnCount: number;
 }
 
-export class RouterError extends Error {}
+export class RouterError extends Error {
+  /**
+   * True when the call reached the model and came back unusable, rather than
+   * failing outright. Only these are worth asking again — see `route`.
+   */
+  readonly malformed: boolean;
+
+  constructor(message: string, malformed = false) {
+    super(message);
+    this.malformed = malformed;
+  }
+}
 
 const SYSTEM_PROMPT = buildSystemPrompt();
 
@@ -42,7 +61,37 @@ export class Router {
     this.config = config;
   }
 
+  /**
+   * Route once, and ask a second time if the first answer was unusable.
+   *
+   * Not a general retry policy: this exists for one observed failure. Models
+   * that support `response_format: json_schema` strict mode do not honour it
+   * reliably — the eval catches the dated `deepseek-v4-flash` returning its
+   * three fields as prose in roughly 3% of calls, which is a whole turn lost
+   * to "the router failed" for something the model actually decided correctly.
+   * A single retry costs one extra call on 3% of turns and nothing on the rest.
+   *
+   * Deliberately *not* extended to transport failures or non-2xx responses:
+   * those are a different problem with a different right answer, and retrying
+   * them here would hide a down provider behind a doubled latency.
+   */
   async route(
+    transcript: string,
+    state: SessionState,
+    signal?: AbortSignal,
+  ): Promise<RouteDecision> {
+    try {
+      return await this.ask(transcript, state, signal);
+    } catch (cause) {
+      if (!(cause instanceof RouterError) || !cause.malformed) throw cause;
+      log.warn("router answered with something unusable, asking once more", {
+        error: cause.message.slice(0, 200),
+      });
+      return this.ask(transcript, state, signal);
+    }
+  }
+
+  private async ask(
     transcript: string,
     state: SessionState,
     signal?: AbortSignal,
@@ -77,9 +126,18 @@ export class Router {
                     type: "string",
                     enum: ["forward", ...META_COMMANDS.map((c) => c.name)],
                   },
+                  // Required even when it does not apply, because strict mode
+                  // requires every property to be — hence "empty string", not
+                  // "omitted", as the way to say there is no name here.
+                  workspace: {
+                    type: "string",
+                    description:
+                      "The workspace name the user said, for workspace commands. " +
+                      "Empty string for every other action.",
+                  },
                   reason: { type: "string" },
                 },
-                required: ["action", "reason"],
+                required: ["action", "workspace", "reason"],
                 additionalProperties: false,
               },
             },
@@ -99,6 +157,7 @@ export class Router {
     log.debug("routed", {
       ms: Date.now() - started,
       action: decision.action,
+      workspace: decision.workspace,
       reason: decision.reason ?? "",
     });
     return decision;
@@ -108,8 +167,11 @@ export class Router {
 function buildSystemPrompt(): string {
   const commands = META_COMMANDS.map((command) => {
     const examples = command.examples.map((e) => `      - "${e}"`).join("\n");
-    return `  ${command.name}\n    ${command.description}\n    Examples:\n${examples}`;
+    const slot = command.takesWorkspace ? "\n    Takes a workspace name.": "";
+    return `  ${command.name}\n    ${command.description}${slot}\n    Examples:\n${examples}`;
   }).join("\n\n");
+
+  const named = META_COMMANDS.filter((c) => c.takesWorkspace).map((c) => c.name);
 
   return [
     "You route spoken utterances in a voice interface for a coding agent called OpenCode.",
@@ -138,8 +200,26 @@ function buildSystemPrompt(): string {
     "4. The transcript comes from speech recognition and may be imperfectly",
     "   punctuated or slightly misheard. Do not treat transcription noise as",
     "   meaning; route on intent.",
+    "5. A workspace is a whole project, not a thing inside one. Files,",
+    "   directories, branches, tests, functions and configs are never",
+    "   workspaces, however the sentence is phrased. 'Delete the old test",
+    "   directory' and 'load the config' are `forward`.",
     "",
-    "Reply with the action and a brief reason.",
+    "The workspace field:",
+    "",
+    `- Fill it in only for ${named.join(", ")}. Every other action leaves it as`,
+    "  an empty string.",
+    "- Put the name the user said, and nothing else. Strip the words around it:",
+    "  articles, verbs, and the nouns people attach to a name in passing —",
+    "  workspace, project, repo, one. 'the parser project' is `parser`; 'a",
+    "  workspace called space game' is `space game`. Spacing, hyphenation and",
+    "  capitalisation do not matter; they are normalised afterwards.",
+    "- Never invent or complete a name that was not said. If one of those",
+    "  actions is clearly meant but no name was spoken, leave the field empty —",
+    "  the user is told what was missing, which is far better than acting on a",
+    "  guessed name.",
+    "",
+    "Reply with the action, the workspace, and a brief reason.",
   ].join("\n");
 }
 
@@ -157,28 +237,36 @@ function parseDecision(payload: unknown): RouteDecision {
   const content = (payload as { choices?: Array<{ message?: { content?: unknown } }> })
     ?.choices?.[0]?.message?.content;
   if (typeof content !== "string") {
-    throw new RouterError("router response had no message content");
+    throw new RouterError("router response had no message content", true);
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
   } catch {
-    throw new RouterError(`router did not return JSON: ${content.slice(0, 200)}`);
+    throw new RouterError(`router did not return JSON: ${content.slice(0, 200)}`, true);
   }
 
   const action = (parsed as { action?: unknown })?.action;
   const reason = (parsed as { reason?: unknown })?.reason;
+  const workspace = (parsed as { workspace?: unknown })?.workspace;
   if (typeof action !== "string") {
-    throw new RouterError("router response had no action");
+    throw new RouterError("router response had no action", true);
   }
 
   // Defensive: a model that invents an action name must not silently become a
   // meta-command. Anything unrecognised falls back to the safe default.
-  if (action !== "forward" && !META_COMMANDS.some((c) => c.name === action)) {
+  const command = META_COMMANDS.find((c) => c.name === action);
+  if (action !== "forward" && !command) {
     log.warn("router returned unknown action, forwarding instead", { action });
-    return { action: "forward", reason: "unknown action from router" };
+    return { action: "forward", workspace: "", reason: "unknown action from router" };
   }
 
-  return { action, reason: typeof reason === "string" ? reason : undefined };
+  return {
+    action,
+    // Dropped for anything that does not take one, so a model that fills the
+    // slot on a `forward` cannot have it read as an argument later.
+    workspace: command?.takesWorkspace && typeof workspace === "string" ? workspace.trim() : "",
+    reason: typeof reason === "string" ? reason : undefined,
+  };
 }

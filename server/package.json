@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.18.0",
+    "env-paths": "^3.0.0",
     "kokoro-js": "^1.2.0",
     "ws": "^8.18.0"
   },

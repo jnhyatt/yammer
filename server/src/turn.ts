@@ -10,14 +10,33 @@
  * uses it to return to idle.
  */
 
+import { WorkspaceLifecycleError } from "./lifecycle.ts";
 import { log } from "./log.ts";
-import { OpenCodeError, type OpenCodeSession } from "./opencode/session.ts";
+import { OpenCodeError } from "./opencode/client.ts";
+import type { PermissionRequest } from "./opencode/permissions.ts";
 import { SPEECH_FORMAT, type ErrorCode, type ServerMessage, type TurnOutcome } from "./protocol.ts";
-import { findCommand } from "./router/commands.ts";
+import {
+  findCommand,
+  spokenWorkspaceError,
+  type CommandContext,
+  type WorkspaceDirectory,
+  type WorkspaceLifecycle,
+} from "./router/commands.ts";
 import { RouterError, type Router } from "./router/router.ts";
 import { SttClient, SttError } from "./stt/groq.ts";
+import {
+  agentApproval,
+  yammerApproval,
+  type PermissionContext,
+} from "./supervisor/approval.ts";
 import type { PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine, TtsError } from "./tts/kokoro.ts";
+import {
+  NoWorkspaceError,
+  WorkspaceUnknownError,
+  type ClientWorkspaces,
+  type WorkspaceSession,
+} from "./workspace.ts";
 
 /** How the orchestrator talks back to whoever owns the socket. */
 export interface TurnSink {
@@ -32,16 +51,31 @@ interface ActiveTurn {
   /** Set once utterance.end arrives and the pipeline starts. */
   processing: boolean;
   abort: AbortController;
+  /**
+   * The conversation this turn runs in, resolved when the pipeline starts.
+   *
+   * Held for the life of the turn rather than looked up again, so that a
+   * workspace switch cannot land halfway through one and leave the reply, the
+   * permission prompts, and the abort pointing at different projects.
+   */
+  session: WorkspaceSession | null;
 }
 
 /** Guard against a stuck client streaming forever. 60s at 16 kHz mono s16le. */
 const MAX_UTTERANCE_BYTES = 60 * 16_000 * 2;
 
+/** What a turn needs beyond its own client to run a workspace meta-command. */
+export interface TurnWorkspaces {
+  registry: WorkspaceDirectory;
+  manager: WorkspaceLifecycle;
+}
+
 export class TurnManager {
   private readonly sink: TurnSink;
   private readonly stt: SttClient;
   private readonly router: Router;
-  private readonly opencode: OpenCodeSession;
+  private readonly client: ClientWorkspaces;
+  private readonly workspaces: TurnWorkspaces;
   private readonly tts: TtsEngine;
   private readonly supervisor: PermissionSupervisor;
 
@@ -52,14 +86,16 @@ export class TurnManager {
     sink: TurnSink,
     stt: SttClient,
     router: Router,
-    opencode: OpenCodeSession,
+    client: ClientWorkspaces,
+    workspaces: TurnWorkspaces,
     tts: TtsEngine,
     supervisor: PermissionSupervisor,
   ) {
     this.sink = sink;
     this.stt = stt;
     this.router = router;
-    this.opencode = opencode;
+    this.client = client;
+    this.workspaces = workspaces;
     this.tts = tts;
     this.supervisor = supervisor;
   }
@@ -69,16 +105,32 @@ export class TurnManager {
    *
    * Only meaningful while a turn is in flight — a permission with no turn to
    * attach to has nobody listening, so it is refused rather than left blocking
-   * OpenCode forever.
+   * OpenCode forever. The workspace has already routed this to the client that
+   * owns the session; what is checked here is that the session is also the one
+   * this client is currently talking in, which is not the same thing once a
+   * client holds conversations in several workspaces at once.
    */
-  handlePermission(request: Parameters<PermissionSupervisor["handle"]>[0]): void {
+  handlePermission(request: PermissionRequest, context: PermissionContext): void {
     const active = this.active;
+    // The directory the tool call can reach through the bind mount, so the
+    // prompt can say what is uncommitted in it. Null only when there is no turn
+    // to attach to, in which case nothing is asked at all.
+    const approval = agentApproval(request, context, active?.session?.workspace.workDir ?? null);
+
     if (!active || !active.processing) {
       log.warn("permission asked with no turn in flight, refusing", { id: request.id });
-      void this.supervisor.refuse(request);
+      void this.supervisor.refuse(approval);
       return;
     }
-    void this.supervisor.handle(request, active.id, active.abort.signal);
+    if (active.session?.currentSessionId !== request.sessionID) {
+      log.warn("permission asked in a session the current turn is not using, refusing", {
+        id: request.id,
+        session: request.sessionID,
+      });
+      void this.supervisor.refuse(approval);
+      return;
+    }
+    void this.supervisor.approve(approval, active.id, active.abort.signal);
   }
 
   /** Route an answer frame, or fall through to ordinary utterance audio. */
@@ -111,6 +163,7 @@ export class TurnManager {
       bytes: 0,
       processing: false,
       abort: new AbortController(),
+      session: null,
     };
     this.sink.send({ t: "turn.accepted", turn });
     log.debug("utterance started", { turn });
@@ -177,7 +230,18 @@ export class TurnManager {
     const id = turn.id;
     const signal = turn.abort.signal;
     const audio = Buffer.concat(turn.chunks);
-    log.info("processing utterance", { turn: id, bytes: audio.length });
+
+    // Resolved once, here, rather than held from construction: which project a
+    // turn belongs to is a property of the client's state when it speaks. It
+    // may be nothing at all — a client that has not said `load` yet can still
+    // create, load and list, so this is only fatal for what actually needs it.
+    const session = this.client.active === null ? null : this.client.session();
+    turn.session = session;
+    log.info("processing utterance", {
+      turn: id,
+      bytes: audio.length,
+      workspace: session?.workspace.name ?? "(none)",
+    });
 
     let transcript: string;
     try {
@@ -190,14 +254,16 @@ export class TurnManager {
     this.sink.send({ t: "transcript", turn: id, text: transcript });
 
     let action: string;
+    let argument: string;
     try {
       this.sink.send({ t: "turn.status", turn: id, state: "routing" });
       const decision = await this.router.route(
         transcript,
-        { sessionId: this.opencode.currentSessionId, turnCount: this.replyCount },
+        { sessionId: session?.currentSessionId ?? null, turnCount: this.replyCount },
         signal,
       );
       action = decision.action;
+      argument = decision.workspace;
     } catch (cause) {
       return this.fail(id, "router_failed", "The router failed, so I didn't act on that.", cause);
     }
@@ -208,8 +274,15 @@ export class TurnManager {
     let spoken: string;
     let outcome: TurnOutcome;
     if (action === "forward") {
+      if (!session) {
+        // Nothing to forward to. The client's very first utterance lands here
+        // if it speaks before saying where, which is why the sentence names the
+        // way out rather than just reporting the state.
+        const cause = new NoWorkspaceError();
+        return this.fail(id, "no_workspace", spokenWorkspaceError(cause)!, cause);
+      }
       try {
-        spoken = await this.opencode.prompt(transcript, signal);
+        spoken = await session.prompt(transcript, signal);
         this.replyCount += 1;
         outcome = "forwarded";
       } catch (cause) {
@@ -222,7 +295,6 @@ export class TurnManager {
           this.supervisor.clearTurn(id);
           return this.finish(id, "denied");
         }
-        console.log(cause);
         return this.fail(id, opencodeCode(cause), spokenOpencodeError(cause), cause);
       }
     } else {
@@ -231,17 +303,50 @@ export class TurnManager {
         return this.fail(id, "internal", "I didn't understand that command.", action);
       }
       try {
-        spoken = await command.run(this.opencode);
+        spoken = await command.run(this.commandContext(id, argument, signal));
         outcome = "meta_command";
       } catch (cause) {
-        console.log(cause);
+        // A workspace command's failures have their own sentences — the
+        // requirements doc asks for one per failure point, and they are the
+        // only thing the user gets to diagnose from.
+        const workspaceError = spokenWorkspaceError(cause);
+        if (workspaceError) return this.fail(id, workspaceCode(cause), workspaceError, cause);
         return this.fail(id, opencodeCode(cause), spokenOpencodeError(cause), cause);
       }
     }
     if (signal.aborted) return;
 
-    await this.speak(id, spoken, signal);
+    // A command may have said everything it had to say already — the denied
+    // delete, whose refusal the supervisor has just spoken.
+    if (spoken.trim() !== "") await this.speak(id, spoken, signal);
     this.finish(id, outcome);
+  }
+
+  /**
+   * What a meta-command is handed. Built per turn, not per connection, because
+   * `say` and `confirm` are tied to the turn tag the client is waiting on.
+   */
+  private commandContext(
+    turn: number,
+    argument: string,
+    signal: AbortSignal,
+  ): CommandContext {
+    return {
+      // Not the turn's own `session`: a command asks for one only if it needs
+      // it, and gets the error with its own sentence when there is none.
+      session: () => this.client.session(),
+      registry: this.workspaces.registry,
+      manager: this.workspaces.manager,
+      client: this.client,
+      argument,
+      say: (text) => this.speak(turn, text, signal),
+      confirm: (description, stakes) =>
+        this.supervisor.approve(
+          yammerApproval({ id: `yammer-${turn}`, description, stakes }),
+          turn,
+          signal,
+        ),
+    };
   }
 
   /** Synthesize and stream, one WebSocket segment per sentence. */
@@ -309,6 +414,23 @@ function spokenSttError(cause: unknown): string {
     return "I didn't catch that.";
   }
   return "I couldn't transcribe that.";
+}
+
+/** Which of the three workspace codes a lifecycle failure is. */
+function workspaceCode(cause: unknown): ErrorCode {
+  if (cause instanceof NoWorkspaceError) return "no_workspace";
+  if (cause instanceof WorkspaceUnknownError) return "workspace_unknown";
+  if (!(cause instanceof WorkspaceLifecycleError)) return "internal";
+  switch (cause.kind) {
+    case "container-gone":
+    case "start-failed":
+    case "port-drift":
+    case "not-ready":
+    case "agent-missing":
+      return "workspace_start_failed";
+    default:
+      return "workspace_failed";
+  }
 }
 
 function opencodeCode(cause: unknown): ErrorCode {

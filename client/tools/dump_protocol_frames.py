@@ -54,7 +54,6 @@ def main() -> int:
                 "AUTH_FAILED": protocol.CloseCode.AUTH_FAILED,
                 "UNSUPPORTED_PROTOCOL": protocol.CloseCode.UNSUPPORTED_PROTOCOL,
                 "PROTOCOL_VIOLATION": protocol.CloseCode.PROTOCOL_VIOLATION,
-                "ALREADY_CONNECTED": protocol.CloseCode.ALREADY_CONNECTED,
             },
         },
         # Verbatim wire text, not a re-serialization: whatever the client would

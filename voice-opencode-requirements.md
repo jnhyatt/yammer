@@ -22,14 +22,16 @@ There are now **two clients**, and the thinness above is the reason a second one
 
 The two halves are in different languages by deliberate choice: each uses the library that is native to its job. The cost is that the WebSocket protocol is a real cross-language contract rather than a shared type definition — see §2, which raises it from an implementation detail to a specified component. With a third language now speaking it, that cost is paid three times and the conformance fixtures are what make it survivable.
 
-The client only operates within a specific project directory it's configured for; OpenCode's filesystem access is scoped to that directory. No remote-repo access, no credentials handling beyond the transport token (§2), no elevated permissions in v1.
+~~The client only operates within a specific project directory it's configured for; OpenCode's filesystem access is scoped to that directory.~~ No remote-repo access, no credentials handling beyond the transport token (§2), no elevated permissions in v1.
+
+**Amended by [yammer-server-v2.md](yammer-server-v2.md).** The scoping survives and is stronger — each project is a container, and the directory is a bind mount rather than a configured path — but it is no longer *a* directory, and it is no longer the client that is configured with it. The client is told nothing about workspaces; it starts in none, and the user says which one they are in. What still holds: no credentials in the container, no elevated permissions, and OpenCode never seeing the host's file tree.
 
 ## Operating assumptions
 
 These are choices, not incidental facts. Changing one invalidates parts of the design.
 
 - **The user is wearing headphones or an earbud.** v1 does no acoustic echo cancellation and does not gate the microphone during playback, so synthesized speech played through a speaker will be picked up by the microphone and can trigger the client's own wake words. The earbud is a hard dependency, not a convenience. Revisit if v1 proves this impractical in the actual use context. On Android the picture is slightly different but the assumption is unchanged: because §9 requires a *communication* capture use case to bring up the LE Audio bidirectional link, that client gets platform echo cancellation and noise suppression whether or not it wants them. That is a side effect to be aware of — it may well be worth turning off for wake-word quality once measured — and not a licence to support speakers.
-- **One user, one project, one client at a time.** No multi-tenancy, no session sharing, no concurrent clients against the same server.
+- ~~**One user, one project, one client at a time.**~~ **Superseded by [yammer-server-v2.md](yammer-server-v2.md).** One user still, and no session sharing — but v2 runs a workspace per project and lifts the one-client rule: several clients may connect at once, each with its own active workspace, and two clients may share a workspace and get a conversation each. "One turn at a time" survives as a per-connection rule. This bullet is left here because it was load-bearing for v1's design and the parts of that design it shaped (per-connection turn state, the `busy` rejection) are still in place.
 - **The network between client and server is trusted-ish but not open.** See §2 for the minimum bar.
 
 ## Components

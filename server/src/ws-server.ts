@@ -2,8 +2,17 @@
  * WebSocket listener: handshake, framing, and connection lifecycle.
  *
  * Deliberately dumb about what a turn means — it validates frames and hands
- * them to a TurnManager. One client at a time (§ Operating assumptions); a
- * second connection is closed with ALREADY_CONNECTED.
+ * them to a TurnManager.
+ *
+ * **Several clients may connect at once**, each with its own active workspace,
+ * its own sessions, and its own turn. Everything per-client already lives in
+ * `handleConnection`, so this is mostly the absence of the old gate: there is
+ * no shared mutable state here to serialize, and the two things that look like
+ * they might be — a workspace's permission stream and its OpenCode — are keyed
+ * by session id precisely so that two clients in one workspace stay apart.
+ *
+ * "One turn at a time" survives, per connection. A person cannot say two things
+ * at once; two people can.
  */
 
 import { timingSafeEqual } from "node:crypto";
@@ -11,7 +20,6 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import type { Config } from "./config.ts";
 import { log } from "./log.ts";
-import { OpenCodeSession } from "./opencode/session.ts";
 import {
   CloseCode,
   PROTOCOL_VERSION,
@@ -23,12 +31,13 @@ import {
   encodeServerMessage,
   type ServerMessage,
 } from "./protocol.ts";
-import type { PermissionWatcher } from "./opencode/permissions.ts";
+import type { WorkspaceLifecycle } from "./router/commands.ts";
 import { Router } from "./router/router.ts";
 import { SttClient } from "./stt/groq.ts";
 import { PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine } from "./tts/kokoro.ts";
 import { TurnManager } from "./turn.ts";
+import { ClientWorkspaces, type WorkspaceRegistry } from "./workspace.ts";
 
 const SERVER_ID = "yammer-server/0.1.0";
 
@@ -38,14 +47,16 @@ const HANDSHAKE_TIMEOUT_MS = 5_000;
 export interface Deps {
   stt: SttClient;
   router: Router;
-  opencode: OpenCodeSession;
+  /** Every project Yammer can work on. Each carries its own OpenCode. */
+  workspaces: WorkspaceRegistry;
+  /** The lifecycle verbs, for the workspace meta-commands. */
+  manager: WorkspaceLifecycle;
   tts: TtsEngine;
-  permissions: PermissionWatcher;
 }
 
 export function startServer(config: Config, deps: Deps): WebSocketServer {
   const wss = new WebSocketServer({ host: config.host, port: config.port });
-  let connected: WebSocket | null = null;
+  let clients = 0;
 
   wss.on("listening", () => {
     log.info("listening", { host: config.host, port: config.port });
@@ -53,16 +64,10 @@ export function startServer(config: Config, deps: Deps): WebSocketServer {
 
   wss.on("connection", (socket, request) => {
     const peer = request.socket.remoteAddress ?? "unknown";
-
-    if (connected && connected.readyState === connected.OPEN) {
-      log.warn("rejecting second client", { peer });
-      socket.close(CloseCode.ALREADY_CONNECTED, "client already connected");
-      return;
-    }
-    connected = socket;
-
+    clients += 1;
     handleConnection(socket, peer, config, deps, () => {
-      if (connected === socket) connected = null;
+      clients -= 1;
+      log.debug("clients connected", { clients });
     });
   });
 
@@ -95,34 +100,25 @@ function handleConnection(
     },
   };
 
-  const supervisor = new PermissionSupervisor(
-    sink,
-    deps.permissions,
-    deps.stt,
-    deps.tts,
-    config.supervisor,
-    () => deps.opencode.abort(),
-  );
+  const supervisor = new PermissionSupervisor(sink, deps.stt, deps.tts, config.supervisor);
+
+  // This client's own view of the workspaces: which one it is in, and its
+  // conversation in each. Permissions reach the turn manager through it —
+  // each session it opens claims its own routing entry on the workspace, which
+  // is what makes "another client's prompt" and "our prompt" distinguishable
+  // on a stream that carries both.
+  const client = new ClientWorkspaces(deps.workspaces);
 
   const turns = new TurnManager(
     sink,
     deps.stt,
     deps.router,
-    deps.opencode,
+    client,
+    { registry: deps.workspaces, manager: deps.manager },
     deps.tts,
     supervisor,
   );
-
-  // Permissions are published globally by OpenCode, so filter to the session
-  // this server actually drives — another OpenCode client's prompts are not
-  // ours to answer.
-  deps.permissions.onAsked((request) => {
-    if (request.sessionID !== deps.opencode.currentSessionId) {
-      log.debug("ignoring permission for another session", { id: request.id });
-      return;
-    }
-    turns.handlePermission(request);
-  });
+  client.attach(turns);
 
   const handshakeTimer = setTimeout(() => {
     if (!authenticated) {
@@ -212,6 +208,9 @@ function handleConnection(
     clearTimeout(handshakeTimer);
     // Disconnection abandons the in-flight turn — there is no resumption.
     turns.abandon();
+    // And stops us claiming permissions for conversations nobody can hear. The
+    // sessions themselves survive on OpenCode; it is only the routing that goes.
+    client.release();
     onClose();
     log.info("client disconnected", { peer, code, reason: reason.toString() });
   });

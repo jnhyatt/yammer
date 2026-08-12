@@ -8,8 +8,15 @@ Runs TypeScript directly under Node's type stripping — there is no build step.
 ## Requirements
 
 - **Node 22+** (developed on 24).
-- A running `opencode serve` (default `http://127.0.0.1:4096`).
+- **Rootless Podman**, with its user socket enabled
+  (`systemctl --user enable --now podman.socket`). Yammer runs each workspace as
+  a container and exits at startup if it cannot reach the socket.
+- The workspace image, built once — see "Workspace containers" below.
 - API keys for STT and the routing LLM.
+
+There is no `opencode serve` to run by hand any more: every workspace is a
+container Yammer starts, and a fresh install has none until you say "create a
+workspace".
 
 The Kokoro weights (~90 MB at `q8`) download on first run and are cached by
 `@huggingface/transformers`. The server loads them before it starts listening,
@@ -62,11 +69,17 @@ halves of the system.
 | `YAMMER_ROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | |
 | `YAMMER_ROUTER_API_KEY` | *(required)* | |
 | `YAMMER_ROUTER_MODEL` | `deepseek/deepseek-v4-flash` | Fixed in config by design; see `npm run eval:router` |
-| `YAMMER_OPENCODE_URL` | `http://127.0.0.1:4096` | |
-| `YAMMER_PROJECT_DIR` | *(required)* | The only directory OpenCode can touch |
 | `YAMMER_OPENCODE_PROVIDER` | *(OpenCode's default)* | See "OpenCode model" below before relying on the default |
 | `YAMMER_OPENCODE_MODEL` | *(OpenCode's default)* | |
 | `YAMMER_OPENCODE_AGENT` | `yammer` | The TTS-aware agent; see "OpenCode agent" below |
+| `YAMMER_STATE_DIR` | *(platform data dir)* | Holds `workspaces.json`; `~/.local/share/yammer` on Linux |
+| `YAMMER_PODMAN_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Required: the server exits if it cannot be reached |
+| `YAMMER_OPENCODE_IMAGE` | `localhost/yammer-opencode:latest` | Never built on demand; see "Workspace containers" below |
+| `YAMMER_WORKSPACE_ROOT` | `~/yammer-workspaces` | Where workspace working directories live on the host |
+| `YAMMER_AGENT_FILE` | `<repo>/.opencode/agent/<agent>.md` | Bind-mounted read-only into every workspace |
+| `YAMMER_OPENCODE_AUTH` | `~/.local/share/opencode/auth.json` | Provider credentials, mounted read-only |
+| `YAMMER_WORKSPACE_READY_SECONDS` | `60` | How long `load` waits for OpenCode inside the container |
+| `YAMMER_WORKSPACE_STOP_SECONDS` | `10` | Grace period before a stop becomes a kill |
 | `YAMMER_SUPERVISOR_VOICE` | `bm_george` | Approval-prompt voice; must differ audibly from `YAMMER_TTS_VOICE` |
 | `YAMMER_SUPERVISOR_ANSWER_SECONDS` | `12` | How long one answer window stays open |
 | `YAMMER_SUPERVISOR_MAX_ATTEMPTS` | `3` | Asks before giving up, then rejects and aborts |
@@ -79,13 +92,13 @@ halves of the system.
 ### OpenCode model
 
 Leaving `YAMMER_OPENCODE_PROVIDER`/`YAMMER_OPENCODE_MODEL` unset makes
-`OpenCodeSession` ask OpenCode for its own default (`client.config.providers()`,
+`OpenCodeClient` ask OpenCode for its own default (`client.config.providers()`,
 first provider's default model). That default is **not guaranteed to be a model
 your OpenCode account can actually use** — it errors on every forwarded turn if
 not, since the failure only surfaces on the first real prompt call.
 
 `opencode/deepseek-v4-flash-free` is a verified-working pair — confirmed with a
-real prompt through `OpenCodeSession.prompt()` end to end, no extra credentials
+real prompt through `OpenCodeClient.prompt()` end to end, no extra credentials
 (it's on OpenCode's own built-in `opencode` provider), no cost. Set both:
 
 ```sh
@@ -104,8 +117,9 @@ Two adjacent options that look right but aren't:
   OpenCode doesn't expose in `config.providers()`; if it starts erroring under
   real use, that's the first thing to suspect.
 
-To see what your account currently has, hit a running `opencode serve` directly:
-`curl http://127.0.0.1:4096/config/providers | jq`.
+To see what your account currently has, ask a running workspace's OpenCode
+directly — its port is in the registry:
+`curl http://127.0.0.1:<port>/config/providers | jq`.
 
 ### OpenCode agent
 
@@ -123,45 +137,65 @@ the sentence the user is guaranteed to hear.
 
 Two things about it are load-bearing and easy to undo by accident:
 
-- **Its permissions are all `allow`, deliberately.** A permission set to `ask`
-  would hang the turn forever: the user has no keyboard and OpenCode has no way
-  to put the question into their earbud. The judgment that a prompt would
-  normally buy is pushed into the agent's own instructions, which tell it to
-  describe destructive or outward-facing actions and stop rather than run them.
-  `external_directory` is `deny`, preserving the directory scoping that
-  `YAMMER_PROJECT_DIR` sets up.
+- **Its permissions are `allow` except for a short list, deliberately.** The
+  container is the safety boundary, so inside it the agent gets an ordinary
+  shell. What stays behind an `ask` is the handful of commands that destroy
+  unrecoverable work through the bind mount — recursive or forced `rm`,
+  `git reset --hard`, `clean`, `checkout --`, `restore`, `branch -D` — because
+  the working directory is a real host directory and no sandbox undoes that.
+  Commands that need credentials are not on the list: there are none in the
+  container, so they fail by themselves. `external_directory` is `deny`, which
+  is what keeps the agent inside the project directory.
 - **OpenCode reads agent files once at boot and does not hot-reload them.** After
-  editing the agent, restart `opencode serve` or nothing changes. The server logs
-  `opencode agent available` at startup when the agent resolves, and warns if it
-  does not — that warning almost always means a stale `opencode serve`.
+  editing the agent, restart the workspace container or nothing changes. The
+  server logs `opencode agent available` when a workspace's agent resolves, and
+  warns if it does not — that warning almost always means a container that has
+  been up since before the edit.
 
-The agent must be visible to OpenCode in whatever directory `YAMMER_PROJECT_DIR`
-points at. When that's this repository, the checked-in file already is. Pointing
-Yammer at another project needs a global copy:
+Nothing has to be copied anywhere: `YAMMER_AGENT_FILE` is bind-mounted read-only
+into every workspace container, so a fresh workspace with an empty working
+directory still gets the agent. That is deliberate — an agent that lived in the
+project being worked on would leave every new workspace running with screen-
+shaped output and no permission gate at all. Editing it needs no image rebuild,
+but does need the affected container restarted.
 
-```sh
-mkdir -p ~/.config/opencode/agent
-cp .opencode/agent/yammer.md ~/.config/opencode/agent/yammer.md
-```
+To fall back to OpenCode's default agent — expect screen formatting read aloud —
+set `YAMMER_OPENCODE_AGENT=build`.
 
-Both locations are valid (`.opencode/agent/` and `.opencode/agents/` are
-accepted, project-scoped merging over global). To fall back to OpenCode's default
-agent — expect screen formatting read aloud — set `YAMMER_OPENCODE_AGENT=build`.
+### Supervisor
 
-### Permission supervisor
+Destructive things are gated by a spoken approval prompt in a second voice. The
+flow is: something asks, `src/supervisor/` says what is about to happen, the user
+answers with one word, and it is settled either way.
 
-Destructive commands are gated by a spoken approval prompt in a second voice.
-The flow is: OpenCode blocks the tool call and publishes `permission.asked`,
-`src/supervisor/` says what is about to happen, the user answers with one word,
-and the call is unblocked or refused.
+**Two things ask, and the supervisor cannot tell them apart.** OpenCode blocks a
+tool call and publishes `permission.asked`; or Yammer itself is about to do
+something irreversible outside any container, which today means a workspace
+`delete`. Both arrive as an `ApprovalRequest`
+([`src/supervisor/approval.ts`](src/supervisor/approval.ts)) — something to say,
+optionally a pattern "always" would widen to, optionally a directory whose
+contents are at stake, and a way to settle it. Everything source-specific is in
+the two adapters and in `speech.ts`; the ask-listen-settle loop never branches on
+where a request came from. Adding a third source means writing an adapter, not
+touching the loop.
 
-Which commands prompt is **not** configured here — it lives in the agent's own
-permission rules in [`.opencode/agent/yammer.md`](../.opencode/agent/yammer.md),
-because that is where OpenCode reads it. Keep the list short: every entry costs
-a ~10 second spoken round trip, so it covers things that leave the machine,
-destroy work, or rewrite history, and nothing else.
+Which agent commands prompt is **not** configured here — it lives in the agent's
+own permission rules in
+[`.opencode/agent/yammer.md`](../.opencode/agent/yammer.md), because that is
+where OpenCode reads it. Keep the list short: every entry costs a ~10 second
+spoken round trip, and the container is what makes the list short in the first
+place.
 
-Three behaviours worth knowing before changing any of it:
+**What the prompt says about state, Yammer looked at itself.** Before asking, it
+runs real `git` against the host-side working directory
+([`src/git.ts`](src/git.ts)) and adds one clause: uncommitted changes, untracked
+files, and — when the directory itself is going — commits that are on no remote.
+A delete of an empty workspace and a delete of a week's work must not sound the
+same. The observation never comes from the container: a summary written by the
+thing being supervised is not evidence. It fails soft, and says nothing when
+there is nothing to say, so that the clause stays worth hearing.
+
+Four behaviours worth knowing before changing any of it:
 
 - **A denial ends the turn.** OpenCode does not resume the model loop after a
   rejected tool call — the assistant message finishes with no text at all
@@ -179,6 +213,10 @@ Three behaviours worth knowing before changing any of it:
   generalizes: answering "always" to `git push origin main --force` saves the
   pattern `git push *`. The supervisor reads that pattern out loud on the first
   ask for exactly that reason.
+- **An answer is never offered where it has nowhere to go.** Yammer's own
+  actions have no pattern to remember, so the menu is "approve or deny" and a
+  heard "always" settles as a one-time yes rather than reporting `always` — which
+  would tell the user they had configured something that does not exist.
 
 Answer matching is in `src/supervisor/keywords.ts` — a pure function with no
 model behind it, and the one part of this repo with real unit tests
@@ -256,24 +294,130 @@ real CUDA install and a modern GPU only needs step 1 (the EP binary) and
 `YAMMER_TTS_DEVICE=cuda`; skip the pip-wheels dance entirely if
 `ldconfig -p | grep cudart` already finds something.
 
+## Workspace containers
+
+Each workspace is one container running one `opencode serve`, created by Yammer
+over Podman's REST socket. Podman must be reachable — the server exits at
+startup if it is not, because a Yammer that cannot create or load a workspace
+would accept an utterance and then fail every command it is given:
+
+```sh
+systemctl --user enable --now podman.socket
+```
+
+**The image is never built on demand.** It is Arch plus `pacman -Syu`, so
+building it inside `create` would turn "make me a workspace" into a four-minute
+wait for a mirror. A missing image is an error naming the fix instead:
+
+```sh
+podman build -t localhost/yammer-opencode:latest -f containers/yammer-opencode/Containerfile .
+```
+
+A stale pinned image is the deliberate default; rebuild it when you want a newer
+OpenCode. Four mounts go into each container:
+
+| Host | Container | |
+| --- | --- | --- |
+| `$YAMMER_WORKSPACE_ROOT/<name>` | `/workspace` | rw — the work itself |
+| `$YAMMER_STATE_DIR/opencode/<name>` | `/root/.local/share/opencode` | rw — **per workspace** |
+| `$YAMMER_OPENCODE_AUTH` | `…/opencode/auth.json` | ro — the one shared thing |
+| `$YAMMER_AGENT_FILE` | `/root/.config/opencode/agent/<agent>.md` | ro |
+
+OpenCode's state directory is per workspace because N containers writing one
+sqlite database is a corruption risk rather than a theoretical one. Credentials
+are the exception, and they are laid back over the top of that mount read-only —
+Podman orders nested mounts by path depth, so the shallower state directory
+mounts first and `auth.json` lands inside it.
+
+The agent comes from Yammer rather than from the project being worked on: a
+fresh workspace has an empty working directory, so an agent living there would
+mean new workspaces silently running with no TTS shaping and no permission gate.
+Editing `$YAMMER_AGENT_FILE` needs no image rebuild, but does need the workspace
+restarted — OpenCode reads agent files once at boot and never hot-reloads.
+
+Ports are published on `127.0.0.1` only, with the host port chosen by the OS at
+create time and recorded in the registry. Containers never need to reach each
+other, so there is no shared network.
+
+## Workspaces by voice
+
+Four spoken commands, handled by Yammer itself and never forwarded to OpenCode:
+
+| Say | What happens |
+| --- | --- |
+| "create a workspace called space game" | container and directory, left **stopped** |
+| "load space game" | starts it if stopped, waits for OpenCode, moves *this client* into it |
+| "what workspaces do I have" | each name, its state, and which one you are in |
+| "delete the space game workspace" | spoken approve/deny prompt, then the container, directory and record |
+
+Three things about these are deliberate and worth knowing before changing them.
+
+**`load` does not create.** A name Yammer does not know is a spoken error. The
+name arrives as a routing model's reading of a Whisper transcript, so a name
+that fails to resolve is at least as likely to be a mishearing as an intention,
+and create-on-miss turns every mishearing into a junk container.
+
+**Names are matched with separators removed.** Whisper decides on its own
+whether a two-word name is one word — the same utterance came back as
+"LiveCheck" and as "live check" in one sitting — so `space-game`, `space game`
+and `SpaceGame` are one workspace. `create` refuses a name that only *sounds*
+like an existing one, because two workspaces nobody can tell apart by voice are
+two workspaces nobody can use.
+
+**`delete` goes through the supervisor**, in its second voice, and silence is a
+no. It is the most destructive thing in the system and it is triggered by the
+least reliable input in it. The prompt says what is in the directory — Yammer's
+own `git status` of it, not the workspace's account of itself — because "delete
+space game" has to sound different when space game holds a week of uncommitted
+work.
+
+**A connection starts in no workspace, and `load` is how you enter one.** There
+is no default: with several workspaces, any default is a guess about which
+project an utterance meant, made by the side of the system with no screen to
+show its guess. Speaking before entering one is an error that names the way out
+(`no_workspace`), which costs one utterance and is never wrong. A reconnecting
+client says `load` again.
+
+**The active workspace is per connection.** Several clients may be connected at
+once, each in its own workspace, and nothing one client says moves another. Two
+clients in the same workspace is supported too, and they get a conversation
+each — sharing one would interleave two people's dialogue into one history. One
+turn at a time is likewise per connection: `busy` means "you are busy", never
+"the server is".
+
+Each failure has its own sentence — `src/router/commands.ts`'s
+`spokenWorkspaceError` is the whole list, one per `LifecycleFailure`. That is
+the point of the kinds existing: "OpenCode inside it never answered" and "it
+doesn't know the agent" mean different things to go and do.
+
 ## Shape
 
 ```
 src/
   index.ts            entrypoint: config, warm-up, listen
+  startup.ts          reads the workspace registry and checks it against Podman
+  lifecycle.ts        create/load/stop/delete for one workspace
   config.ts           environment → Config
   protocol.ts         wire types + codecs (mirrors ../protocol/PROTOCOL.md)
   ws-server.ts        handshake, framing, connection lifecycle
   turn.ts             turn state machine: STT → route → act → speak
+  workspace.ts        projects, and the sessions clients hold in them
+  git.ts              what is actually at stake in a working directory
   wav.ts              PCM/WAV helpers
   stt/groq.ts         OpenAI-compatible transcription
+  container/runtime.ts     what Yammer needs from a container runtime
+  container/podman.ts      that, over Podman's REST socket
+  container/fake.ts        that, in memory, for tests
+  registry/store.ts        the workspace registry's file on disk
+  registry/reconcile.ts    registry vs. reality, as a pure diff
   router/commands.ts  the meta-command catalogue
   router/router.ts    the routing LLM call
-  opencode/session.ts one continuous OpenCode session per sitting
+  opencode/client.ts  the HTTP client for one workspace's OpenCode
   opencode/permissions.ts  watches for blocked tool calls, answers them
   supervisor/supervisor.ts spoken approval prompt in a second voice
+  supervisor/approval.ts   what gets approved, whoever asked for it
   supervisor/keywords.ts   approve/always/deny matching (pure, tested)
-  supervisor/speech.ts     turns a shell command into something hearable
+  supervisor/speech.ts     every sentence the supervisor says
   tts/kokoro.ts       sentence-chunked streaming synthesis
 ```
 
@@ -283,23 +427,43 @@ src/
 npm test        # node --test over src/**/*.test.ts — 90 tests, no network
 ```
 
-Three suites, and what they have in common is that all three guard failures that
-are **silent**. Everything else here fails loudly: a bad model id 404s, a
-protocol mismatch closes the socket.
+Coverage is deliberately narrow, and the thing every suite has in common is that
+it guards a **silent** failure. Most of this repo fails loudly — a bad model id
+404s, a protocol mismatch closes the socket — so those paths need no test.
 
-- `supervisor/keywords.test.ts` — the approve/deny matcher. A mistranscription
-  classified as "approve" force-pushes a branch and looks like nothing went
-  wrong. The fixtures are real Whisper output shapes.
+- `supervisor/keywords.test.ts` — a mistranscription classified as "approve"
+  force-pushes a branch and looks like nothing went wrong. The fixtures are real
+  Whisper output shapes.
 - `protocol.test.ts` — cross-language codec conformance. The frames it decodes
   are dumped from the *real* Python client module by
   `client/tools/dump_protocol_frames.py`, so it checks two implementations
   against each other rather than checking that JSON round-trips. Regenerate that
   fixture after any protocol change; a diff there means the other views need the
   same edit.
-- `ws-server.test.ts` — handshake, close codes, busy rejection and the error
-  path, driving the real `startServer` with the four networked dependencies
-  faked. Its load-bearing assertion is that **every turn exit path emits
-  `turn.end`**; a path that skips it strands the client with no way back to idle.
+- `ws-server.test.ts` — handshake, close codes, busy rejection, permission
+  routing, and the invariant that every turn exit path emits `turn.end`. Also
+  the two-client cases: server-side state that looks per-client but is not
+  raises nothing at all, it just answers one person out of another person's
+  project.
+- `registry/store.test.ts` and `registry/reconcile.test.ts` — a workspace that
+  quietly drops out of the registry, or a status that is confidently wrong,
+  produce no error at the time and a mystery later.
+- `lifecycle.test.ts` — `load` has several distinct failure points and each owes
+  the user a different spoken sentence. Two of them collapsing into one message
+  is invisible until someone is standing there being told the wrong thing.
+- `opencode/client.test.ts` — one test, for one observed hang: a rootless
+  published port accepts connections before OpenCode is listening behind it, and
+  an unbounded probe waits there forever with nothing in the log.
+- `router/commands.test.ts` — the spoken half of the workspace commands: that
+  every failure kind reads out differently, that `load` never creates, and that
+  a denied `delete` deletes nothing. All three are silent in the only way that
+  counts here — they typecheck, log nothing, and are wrong out loud.
+- `supervisor/approval.test.ts` — what the user was asked and what their answer
+  did: that "always" is never offered where nothing can be remembered, and that
+  an unreachable OpenCode still leaves the agent stopped.
+- `git.test.ts` — the grounded clause, against real repositories in temporary
+  directories. A fake `git` would only prove this module agrees with someone's
+  memory of porcelain output, which is exactly the thing that would be wrong.
 
 ## The fake server
 
@@ -331,11 +495,17 @@ npm run eval:router -- <model-id> [<model-id> ...]     # any OpenRouter-compatib
 Scores model(s) against `src/router/eval/cases.ts` by driving the real `Router`
 class. Reports accuracy by category, latency, and — separately — any
 **critical misroutes**: a `forward` case in the adversarial set (e.g. "start a
-new file for the session handler") routed to `new_session` instead. Those are
-the failure that matters; a wrong `report_usage` just answers a question that
-wasn't asked, but a wrong `new_session` silently discards the conversation with
-no undo. When two or more models run, disagreements between them are listed
-separately at the end.
+new file for the session handler") routed to a destructive command instead.
+Those are the failure that matters; a wrong `report_usage` just answers a
+question that wasn't asked, but a wrong `new_session` silently discards the
+conversation and a wrong `delete_workspace` destroys a working directory. When
+two or more models run, disagreements between them are listed separately at the
+end.
+
+Workspace cases are scored on the **extracted name** as well as the action,
+compared after the same normalisation the server applies — so a model that
+answers "Space Game" for `space-game` is right, and one that answers "parser
+project" for `parser` is a miss reported in its own section.
 
 Needs only `YAMMER_ROUTER_API_KEY` (`.env` or exported) — nothing else the
 server needs. Add cases to `cases.ts` whenever `META_COMMANDS` grows; that's the
@@ -350,3 +520,9 @@ lives beside the description, so there is no second place to update.
 Write the `description` to say *when it applies and when it doesn't* — the
 router's failure mode is misrouting an ordinary coding instruction ("start a new
 file") into a meta-command, so the boundaries matter more than the summary.
+
+Set `takesWorkspace: true` if it needs a name, and read it from
+`context.argument` — the router fills that slot only for commands that declare
+it, so a name the model volunteers on a `forward` can never be read as an
+argument. `context.say` speaks before the command finishes (for anything with a
+wait in it) and `context.confirm` is the spoken approve/deny gate.
