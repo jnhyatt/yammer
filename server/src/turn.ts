@@ -24,7 +24,12 @@ import {
 } from "./router/commands.ts";
 import { RouterError, type Router } from "./router/router.ts";
 import { SttClient, SttError } from "./stt/groq.ts";
-import type { PermissionContext, PermissionSupervisor } from "./supervisor/supervisor.ts";
+import {
+  agentApproval,
+  yammerApproval,
+  type PermissionContext,
+} from "./supervisor/approval.ts";
+import type { PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine, TtsError } from "./tts/kokoro.ts";
 import { WorkspaceUnknownError, type ClientWorkspaces, type WorkspaceSession } from "./workspace.ts";
 
@@ -102,9 +107,14 @@ export class TurnManager {
    */
   handlePermission(request: PermissionRequest, context: PermissionContext): void {
     const active = this.active;
+    // The directory the tool call can reach through the bind mount, so the
+    // prompt can say what is uncommitted in it. Null only when there is no turn
+    // to attach to, in which case nothing is asked at all.
+    const approval = agentApproval(request, context, active?.session?.workspace.workDir ?? null);
+
     if (!active || !active.processing) {
       log.warn("permission asked with no turn in flight, refusing", { id: request.id });
-      void this.supervisor.refuse(request, context);
+      void this.supervisor.refuse(approval);
       return;
     }
     if (active.session?.currentSessionId !== request.sessionID) {
@@ -112,10 +122,10 @@ export class TurnManager {
         id: request.id,
         session: request.sessionID,
       });
-      void this.supervisor.refuse(request, context);
+      void this.supervisor.refuse(approval);
       return;
     }
-    void this.supervisor.handle(request, active.id, active.abort.signal, context);
+    void this.supervisor.approve(approval, active.id, active.abort.signal);
   }
 
   /** Route an answer frame, or fall through to ordinary utterance audio. */
@@ -271,7 +281,6 @@ export class TurnManager {
           this.supervisor.clearTurn(id);
           return this.finish(id, "denied");
         }
-        console.log(cause);
         return this.fail(id, opencodeCode(cause), spokenOpencodeError(cause), cause);
       }
     } else {
@@ -316,8 +325,12 @@ export class TurnManager {
       client: this.client,
       argument,
       say: (text) => this.speak(turn, text, signal),
-      confirm: (question) =>
-        this.supervisor.confirm(turn, `yammer-${turn}`, question, signal),
+      confirm: (description, stakes) =>
+        this.supervisor.approve(
+          yammerApproval({ id: `yammer-${turn}`, description, stakes }),
+          turn,
+          signal,
+        ),
     };
   }
 

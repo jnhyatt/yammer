@@ -1,54 +1,46 @@
 /**
- * The permission supervisor: a spoken approval prompt in a second voice.
+ * The supervisor: a spoken approval prompt in a second voice.
  *
- * When OpenCode blocks a tool call, this asks the user out loud, listens for a
- * one-word answer, and unblocks the call. It runs *inside* an already-active
- * turn — the client stays in its waiting state throughout, and the turn tag
- * never changes.
+ * Something wants to do something irreversible. This asks the user out loud,
+ * listens for a one-word answer, and settles it. It runs *inside* an already-
+ * active turn — the client stays in its waiting state throughout, and the turn
+ * tag never changes.
  *
- * Three constraints shape it:
+ * **It is deliberately blind to who asked.** A blocked OpenCode tool call and a
+ * workspace delete Yammer is about to perform arrive here as the same
+ * `ApprovalRequest` (see `approval.ts`), because from the user's side they are
+ * the same event: a voice interrupting to ask permission for something that
+ * cannot be taken back. Everything that differs between the two lives in the
+ * adapters and in `speech.ts`.
  *
- * - **A denial ends the turn.** OpenCode does not resume the model loop after a
- *   rejected tool call; the assistant message finishes with no text at all. So
- *   the supervisor speaks the outcome itself rather than leaving it to the
- *   agent, which will never get the chance.
+ * Three constraints shape the loop:
+ *
+ * - **A denial ends the turn**, for the agent-sourced half. OpenCode does not
+ *   resume the model loop after a rejected tool call; the assistant message
+ *   finishes with no text at all. So the supervisor speaks the outcome itself
+ *   rather than leaving it to the agent, which will never get the chance.
  * - **Silence means the user is not there.** The realistic reason nobody answers
- *   is that the headphones are out. Rejecting *and* aborting stops the agent
- *   from working unsupervised; the OpenCode session survives, so the user
- *   resumes by asking about it whenever they come back.
- * - **Every exit path resolves the request,** including failures. A path that
+ *   is that the headphones are out. Rejecting *and* stopping the work keeps the
+ *   agent from carrying on unsupervised; the OpenCode session survives, so the
+ *   user resumes by asking about it whenever they come back.
+ * - **Every exit path settles the request,** including failures. A path that
  *   skips `permission.resolved` strands the client in its answer window exactly
  *   as a missing `turn.end` strands it in waiting.
  */
 
 import type { Config } from "../config.ts";
+import { observeWorkingTree, stakesSentence } from "../git.ts";
 import { log } from "../log.ts";
-import type { PermissionReply, PermissionRequest } from "../opencode/permissions.ts";
 import { SPEECH_FORMAT, type PermissionResponse, type ServerMessage } from "../protocol.ts";
 import { SttClient, SttError } from "../stt/groq.ts";
 import { TtsEngine } from "../tts/kokoro.ts";
+import type { ApprovalRequest } from "./approval.ts";
 import { matchAnswer } from "./keywords.ts";
-import { askQuestion, outcomeSentence, repromptQuestion } from "./speech.ts";
+import { askQuestion, failureSentence, outcomeSentence, repromptQuestion } from "./speech.ts";
 
 export interface SupervisorSink {
   send(msg: ServerMessage): void;
   sendAudio(turn: number, pcm: Buffer): void;
-}
-
-/**
- * How to act on a request, supplied per request rather than per supervisor.
- *
- * Both halves are properties of the session that raised the question, not of
- * the client being asked it: with a workspace per project there is a permission
- * stream per workspace, so "which server do I answer" has to travel with the
- * request. Phase 5 widens this into an approval-request abstraction that
- * Yammer's own destructive commands can also present.
- */
-export interface PermissionContext {
-  /** Answer the request, unblocking the tool call either way. */
-  reply(id: string, reply: PermissionReply): Promise<void>;
-  /** Stop the agent that raised it. Only the no-answer path uses this. */
-  abortTurn(): Promise<void>;
 }
 
 /** Biases Whisper toward the words we actually expect. Cheap, and it works. */
@@ -103,25 +95,32 @@ export class PermissionSupervisor {
   }
 
   /**
-   * Ask, listen, answer. Resolves once the request is settled either way; the
-   * caller does not wait on this — OpenCode's blocked prompt call is what waits.
+   * Ask, listen, settle. True if it was approved.
+   *
+   * The agent-sourced caller ignores the return value — OpenCode's blocked
+   * prompt call is what waits, and `settle` is what unblocks it. Yammer's own
+   * callers are the ones that need the boolean, because for them this *is* the
+   * decision.
    */
-  async handle(
-    request: PermissionRequest,
+  async approve(
+    request: ApprovalRequest,
     turn: number,
     signal: AbortSignal,
-    context: PermissionContext,
-  ): Promise<void> {
-    log.info("supervising permission", { id: request.id, turn });
+  ): Promise<boolean> {
+    log.info("supervising an approval", { id: request.id, turn, source: request.source });
 
     try {
+      // Before the first word, because it is part of the first question: what is
+      // sitting in the directory this would damage. Yammer's own look at it.
+      const stakes = await this.stakes(request);
+
       for (let attempt = 0; attempt < this.config.maxAttempts; attempt += 1) {
-        if (signal.aborted) return await this.settle(request, turn, "reject", false, context);
+        if (signal.aborted) return await this.settle(request, turn, "reject", false);
 
         const question =
           attempt === 0
-            ? askQuestion(request)
-            : repromptQuestion(this.lastMiss === "silence" ? "silence" : "unrecognized");
+            ? askQuestion(request, stakes)
+            : repromptQuestion(this.lastMiss, request.always !== null);
 
         this.sink.send({
           t: "permission.ask",
@@ -131,20 +130,23 @@ export class PermissionSupervisor {
           attempt,
         });
         await this.speak(turn, question, signal);
-        if (signal.aborted) return await this.settle(request, turn, "reject", false, context);
+        if (signal.aborted) return await this.settle(request, turn, "reject", false);
 
         const audio = await this.collectAnswer(turn, request.id);
         const match = await this.classify(audio);
         this.lastMiss = match.kind === "silence" ? "silence" : "unrecognized";
 
         if (match.kind === "approve") {
-          return await this.settle(request, turn, "once", true, context);
+          return await this.settle(request, turn, "once", true);
         }
         if (match.kind === "always") {
-          return await this.settle(request, turn, "always", true, context);
+          // With nothing to widen to, "always" is just a loud yes — and it must
+          // not be reported as `always`, which would claim something was
+          // remembered when nothing was.
+          return await this.settle(request, turn, request.always !== null ? "always" : "once", true);
         }
         if (match.kind === "deny") {
-          return await this.settle(request, turn, "reject", true, context);
+          return await this.settle(request, turn, "reject", true);
         }
 
         log.info("answer not recognized", {
@@ -156,148 +158,79 @@ export class PermissionSupervisor {
       }
 
       // Out of attempts: treat it as nobody being there.
-      await this.settle(request, turn, "timeout", true, context);
+      return await this.settle(request, turn, "timeout", true);
     } catch (cause) {
       log.error("supervisor failed", { id: request.id, error: String(cause) });
       this.sink.send({
         t: "error",
         turn,
         code: "supervisor_failed",
-        message: "The approval prompt failed, so I denied it.",
+        message: failureSentence(request.source),
       });
-      // Never leave OpenCode blocked on a prompt we can no longer drive.
-      await this.settle(request, turn, "timeout", false, context).catch(() => {});
+      // Anything unexplained is a no, and never a prompt left hanging: an
+      // unsettled request wedges OpenCode on a blocked tool call forever.
+      return await this.settle(request, turn, "timeout", false).catch(() => false);
     }
   }
 
   /**
-   * Reply to OpenCode, tell the client, and say what happened.
+   * Act on the decision, tell the client, and say what happened.
    *
-   * `timeout` is not one of OpenCode's replies — it maps to `reject` on the wire
-   * and additionally aborts the turn, which is the difference between "not that
-   * one" and "I'm not here, stop".
+   * `timeout` is not one of OpenCode's replies — the adapter maps it to a
+   * rejection and additionally stops the work, which is the difference between
+   * "not that one" and "I'm not here, stop".
+   *
+   * The sentence is awaited rather than fired off, because a Yammer-sourced
+   * caller speaks again the moment this returns: two synthesis loops running at
+   * once would interleave their segments, and both number theirs from zero.
    */
   private async settle(
-    request: PermissionRequest,
+    request: ApprovalRequest,
     turn: number,
     response: PermissionResponse,
     speakOutcome: boolean,
-    context: PermissionContext,
-  ): Promise<void> {
-    const reply = response === "timeout" ? "reject" : response;
+  ): Promise<boolean> {
     try {
-      await context.reply(request.id, reply);
+      await request.settle(response);
     } catch (cause) {
-      log.error("could not answer permission", { id: request.id, error: String(cause) });
+      log.error("could not settle an approval", { id: request.id, error: String(cause) });
     }
 
-    if (reply === "reject") this.deniedTurn = turn;
-
-    if (response === "timeout") {
-      try {
-        await context.abortTurn();
-      } catch (cause) {
-        log.warn("could not abort the turn after a timeout", { error: String(cause) });
-      }
-    }
+    const approved = response === "once" || response === "always";
+    // Only the agent's turn can be ended by a refusal; a refused workspace
+    // delete leaves the turn perfectly healthy and still owing a sentence.
+    if (!approved && request.source === "agent") this.deniedTurn = turn;
 
     this.sink.send({ t: "permission.resolved", turn, id: request.id, response });
 
     if (speakOutcome) {
       // No signal: this sentence is the user's only notification of the
       // outcome, so it outlives the turn's own cancellation.
-      await this.speak(turn, outcomeSentence(response)).catch((cause) => {
+      await this.speak(turn, outcomeSentence(request.source, response)).catch((cause) => {
         log.warn("could not speak the outcome", { error: String(cause) });
       });
     }
+    return approved;
   }
 
   /**
-   * Ask the user to approve something **Yammer** is about to do, rather than
-   * something a container asked for.
+   * The grounded clause, or null.
    *
-   * Workspace `delete` is the case that exists today: it is triggered by a
-   * routing model's reading of an imperfect transcript, it destroys a working
-   * directory, and it happens outside any container — so it is exactly the
-   * "operations Yammer performs on the user's behalf outside the sandbox" the
-   * requirements doc routes through this gate.
-   *
-   * It shares the answer window, the keyword matcher and the second voice with
-   * `handle`, and differs in what it can offer: there is no OpenCode request to
-   * reply to, and no pattern for "always" to widen to, so a heard "always" is
-   * taken as this-one-time and nothing is remembered. Silence denies.
-   *
-   * Phase 5 is where this and `handle` become one source-agnostic path; keeping
-   * them separate for now avoids reshaping the OpenCode side to land a gate the
-   * requirements doc already asks for.
+   * Never fatal: a directory that cannot be read is a reason to say less, not a
+   * reason to fail an approval prompt the user is waiting on.
    */
-  async confirm(
-    turn: number,
-    id: string,
-    question: string,
-    signal: AbortSignal,
-  ): Promise<boolean> {
-    log.info("supervising a yammer action", { id, turn });
+  private async stakes(request: ApprovalRequest): Promise<string | null> {
+    if (!request.stakes) return null;
     try {
-      for (let attempt = 0; attempt < this.config.maxAttempts; attempt += 1) {
-        if (signal.aborted) return this.resolveConfirm(turn, id, "reject", false);
-
-        const asked =
-          attempt === 0
-            ? question
-            : repromptQuestion(this.lastMiss === "silence" ? "silence" : "unrecognized");
-
-        this.sink.send({ t: "permission.ask", turn, id, question: asked, attempt });
-        await this.speak(turn, asked, signal);
-        if (signal.aborted) return this.resolveConfirm(turn, id, "reject", false);
-
-        const match = await this.classify(await this.collectAnswer(turn, id));
-        this.lastMiss = match.kind === "silence" ? "silence" : "unrecognized";
-
-        // "always" has nothing to widen to here, so it is just a loud yes.
-        if (match.kind === "approve" || match.kind === "always") {
-          return this.resolveConfirm(turn, id, "once", true);
-        }
-        if (match.kind === "deny") return this.resolveConfirm(turn, id, "reject", true);
-
-        log.info("answer not recognized", { id, attempt, kind: match.kind });
-      }
-      return this.resolveConfirm(turn, id, "timeout", true);
+      const tree = await observeWorkingTree(request.stakes.directory);
+      return stakesSentence(tree, request.stakes.scope);
     } catch (cause) {
-      log.error("supervisor failed", { id, error: String(cause) });
-      this.sink.send({
-        t: "error",
-        turn,
-        code: "supervisor_failed",
-        message: "The approval prompt failed, so I didn't do it.",
+      log.warn("could not observe the working tree", {
+        directory: request.stakes.directory,
+        error: String(cause),
       });
-      // Anything unexplained is a no. Nothing is blocked waiting on this — the
-      // caller is Yammer itself — so the only thing to get right is the answer.
-      return this.resolveConfirm(turn, id, "reject", false);
+      return null;
     }
-  }
-
-  /**
-   * Close the client's answer window and say what was decided.
-   *
-   * The sentence is awaited rather than fired off, because the caller speaks
-   * again the moment this returns: two synthesis loops running at once would
-   * interleave their segments, and both number theirs from zero.
-   */
-  private async resolveConfirm(
-    turn: number,
-    id: string,
-    response: PermissionResponse,
-    speakOutcome: boolean,
-  ): Promise<boolean> {
-    this.sink.send({ t: "permission.resolved", turn, id, response });
-    if (speakOutcome) {
-      const sentence = response === "once" ? "Okay, doing it." : "Okay, leaving it alone.";
-      await this.speak(turn, sentence).catch((cause) => {
-        log.warn("could not speak the outcome", { error: String(cause) });
-      });
-    }
-    return response === "once";
   }
 
   private async classify(audio: Buffer | null) {
@@ -393,11 +326,11 @@ export class PermissionSupervisor {
    * or no client attached. Leaving it unanswered would wedge `opencode serve`
    * holding a blocked tool call indefinitely.
    */
-  async refuse(request: PermissionRequest, context: PermissionContext): Promise<void> {
+  async refuse(request: ApprovalRequest): Promise<void> {
     try {
-      await context.reply(request.id, "reject");
+      await request.settle("reject");
     } catch (cause) {
-      log.error("could not refuse an unattended permission", {
+      log.error("could not refuse an unattended request", {
         id: request.id,
         error: String(cause),
       });

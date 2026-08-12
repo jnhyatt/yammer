@@ -96,6 +96,8 @@ interface Harness {
   workspace: Workspace;
   /** A second workspace, for the tests about two clients not colliding. */
   other: WorkspaceFake;
+  /** Workspaces the lifecycle was actually asked to destroy. */
+  deleted: string[];
   /** The session id the fake OpenCode hands out, once one has been created. */
   sessionId(): string | null;
   /** Every session id handed out in the default workspace, in order. */
@@ -175,7 +177,10 @@ function makeDeps(options: FakeOptions = {}): Harness {
     // the price of not standing up Groq, OpenRouter, OpenCode and Kokoro.
     const workspace = new Workspace({
       name,
-      workDir: "/tmp",
+      // Deliberately not a real directory: an approval prompt grounds itself by
+      // looking at the workspace's working tree, and a path that does not exist
+      // is how that stays out of these tests. `git.test.ts` covers the looking.
+      workDir: `/nonexistent/${name}`,
       baseUrl: "http://127.0.0.1:0",
       opencode: opencode as unknown as OpenCodeClient,
       permissions: permissions as unknown as PermissionWatcher,
@@ -213,10 +218,13 @@ function makeDeps(options: FakeOptions = {}): Harness {
 
   // Both workspaces are already up, so `load` is only ever the switch. The
   // lifecycle's own failures have their own suite.
+  const deleted: string[] = [];
   const manager = {
     create: async (name: string) => ({ name }),
     load: async (name: string) => ({ name }),
-    delete: async () => {},
+    delete: async (name: string) => {
+      deleted.push(name);
+    },
   };
 
   return {
@@ -224,6 +232,7 @@ function makeDeps(options: FakeOptions = {}): Harness {
     recorder,
     workspace: primary.workspace,
     other,
+    deleted,
     sessionId: () => primary.sessions.at(-1) ?? null,
     workspaceSessions: () => primary.sessions,
     emitPermission: (request) => primary.emit(request),
@@ -887,6 +896,71 @@ describe("permission routing", () => {
       assert.deepEqual(harness.recorder.replies, [{ id: "per_late", reply: "reject" }]);
     });
   });
+});
+
+// --- Yammer's own approvals ------------------------------------------------
+
+describe("spoken approval for Yammer's own actions", () => {
+  // The supervisor is invoked from two directions, and this is the one that has
+  // no container in it at all: Yammer asking about something Yammer is about to
+  // do. It has to reach the client over the same three messages a blocked tool
+  // call does, or the client would need to learn a second way to be asked.
+
+  /** Say something, answer the prompt it raises, and run to `turn.end`. */
+  async function deleteTurn(client: TestClient, id: number): Promise<Record<string, unknown>> {
+    client.send(JSON.stringify({ t: "utterance.begin", turn: id }));
+    await client.next((m) => m["t"] === "turn.accepted" && m["turn"] === id, "turn.accepted");
+    client.send(encodeAudioFrame(id, Buffer.from([1, 0])));
+    client.send(JSON.stringify({ t: "utterance.end", turn: id }));
+
+    const ask = await client.ofType("permission.ask");
+    client.send(JSON.stringify({ t: "answer.begin", turn: id, id: ask["id"] }));
+    client.send(encodeAudioFrame(id, Buffer.from([1, 0])));
+    client.send(JSON.stringify({ t: "answer.end", turn: id, id: ask["id"] }));
+    return ask;
+  }
+
+  const deleting = { action: "delete_workspace", workspace: "testproject" };
+
+  it("asks before deleting a workspace, and deletes when told to", async () => {
+    const harness = makeDeps({ route: async () => deleting });
+    await withServer(harness.deps, async (connect) => {
+      const client = connect();
+      await client.hello();
+      await client.ofType("hello.ok");
+
+      const ask = await deleteTurn(client, 30);
+      const question = String(ask["question"]);
+      assert.match(question, /cannot be undone/);
+      // The menu comes from the supervisor, and must not offer "always" for a
+      // request with nothing to remember.
+      assert.match(question, /Say approve or deny\./);
+      assert.doesNotMatch(question, /always/);
+
+      assert.equal((await client.ofType("permission.resolved"))["response"], "once");
+      assert.deepEqual(harness.deleted, ["testproject"]);
+      assert.equal((await client.ofType("turn.end"))["outcome"], "meta_command");
+    });
+  });
+
+  it("deletes nothing when the answer is no", async () => {
+    const harness = makeDeps({
+      route: async () => deleting,
+      transcribeAnswer: async () => "deny",
+    });
+    await withServer(harness.deps, async (connect) => {
+      const client = connect();
+      await client.hello();
+      await client.ofType("hello.ok");
+
+      await deleteTurn(client, 31);
+      assert.equal((await client.ofType("permission.resolved"))["response"], "reject");
+      assert.deepEqual(harness.deleted, []);
+      // Still a completed turn, not an error: refusing is a normal outcome.
+      assert.equal((await client.ofType("turn.end"))["outcome"], "meta_command");
+    });
+  });
+
 });
 
 // --- Error path ------------------------------------------------------------

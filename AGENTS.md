@@ -90,9 +90,9 @@ Config comes from the environment, with a `.env` loaded at startup — first fil
 found wins, files are never merged, and the real environment always beats the
 file. Both READMEs document the search order.
 
-`npm test` (server) runs eight suites. What they have in common is that all
-eight guard failures that are **silent** — everything else here fails loudly,
-since a bad model id 404s and a protocol mismatch closes the socket.
+`npm test` (server) runs ten suites. What they have in common is that all ten
+guard failures that are **silent** — everything else here fails loudly, since a
+bad model id 404s and a protocol mismatch closes the socket.
 
 - `supervisor/keywords.test.ts` — the approve/deny matcher. A mistranscription
   classified as "approve" force-pushes a branch and looks like success.
@@ -124,6 +124,15 @@ since a bad model id 404s and a protocol mismatch closes the socket.
   `delete` that runs without a spoken yes are all invisible to a typechecker
   and expensive in exactly one place: out loud, to someone who can't see a
   screen.
+- `supervisor/approval.test.ts` — the other half of that conversation: what the
+  user was asked, and what the answer does. An approval that offers "always"
+  when nothing can be remembered, or reports `always` when nothing was, leaves
+  the user believing they configured something that does not exist.
+- `git.test.ts` — what Yammer says is in a directory, checked against real git
+  in real temporary repositories. Faking git here would only prove this module
+  agrees with someone's memory of porcelain output, which is the thing that
+  would be wrong. A prompt that says nothing is at stake while a week of
+  uncommitted work sits there is worse than no prompt.
 
 **One thing is still worth promoting into a checked-in test**: the `.env` parser
 parity check. `client/.../env.py` hand-implements Node's `process.loadEnvFile`
@@ -176,6 +185,21 @@ standing: 73/73 for the default model, no critical misroutes.
   which meant the *real* gate never fired either. If you catch yourself adding a
   rule to the agent's prompt to prevent an action, that belongs in its
   permission rules instead.
+- **The container is the boundary; the ask-list is only about the bind mount.**
+  Almost anything the agent does inside its own sandbox is acceptable, so the
+  agent's `ask` rules are not a tiered classification of shell commands — they
+  are the short "don't delete everything" list, because the working directory is
+  a real host directory and uncommitted work in it is not recoverable by any
+  means. Anything needing credentials (pushes, publishes, releases) is *not* on
+  the list: there are none in the container, so those fail on their own, and
+  gating them would spend a ~10s spoken round trip to authorise an error. Adding
+  an entry means arguing that it destroys unrecoverable work.
+- **Anything the supervisor says about state, it has to have looked at itself.**
+  The approval loop is LLM-free end to end, and a summary that came from the
+  container is a description written by the thing being supervised. `git.ts`
+  runs real `git` against the host-side working directory for exactly this
+  reason — it is why working directories are Yammer-owned bind mounts in the
+  first place. It fails soft: no git, no directory, no sentence.
 - **Every turn exit path emits `turn.end`,** including failures. The client uses
   it to leave the WAITING state — a path that skips it strands the client.
 - Server: no build step. It runs under Node's type stripping, so **no TypeScript

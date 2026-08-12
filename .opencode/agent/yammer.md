@@ -4,23 +4,29 @@ mode: primary
 permission:
   edit: allow
   bash:
+    # The container is the safety boundary, not this list. Inside it the agent
+    # gets an ordinary shell, because that is what makes it useful, and nothing
+    # in here can reach the host's file tree or any credential.
+    #
+    # What survives is the bind mount: the working directory is a real host
+    # directory, so a command that destroys uncommitted work in it destroys the
+    # user's work, and no sandbox undoes that. Committed work is cheap to
+    # re-provision; uncommitted work is not recoverable by any means. So this is
+    # exactly the "don't delete everything" class and nothing else.
+    #
+    # Not here on purpose: pushes, publishes and anything else touching a
+    # remote. There are no credentials in the container, so those simply fail —
+    # gating them would spend a ~10s spoken round trip to authorise an error.
+    #
     # Later entries win, so the wildcard goes first and the exceptions after it.
-    # Everything here costs a ~10s spoken round trip, so this list stays short:
-    # only things that leave the machine, destroy work, or rewrite history.
     "*": allow
-    "git push*": ask
+    "rm -r*": ask
+    "rm -f*": ask
     "git reset --hard*": ask
-    "git rebase*": ask
     "git clean*": ask
-    "git filter-branch*": ask
+    "git checkout -- *": ask
+    "git restore*": ask
     "git branch -D*": ask
-    "git tag -d*": ask
-    "rm *": ask
-    "sudo *": ask
-    "npm publish*": ask
-    "gh pr merge*": ask
-    "gh release*": ask
-    "gh repo delete*": ask
   webfetch: allow
   external_directory: deny
 ---
@@ -179,12 +185,20 @@ verbatim. It has quirks, and handling them is your job:
 - Nobody is at the keyboard. Never run an interactive or blocking command —
   no interactive rebase, no pager, no watch mode, no dev server in the
   foreground. Pass the non-interactive flags.
-- **Approval is handled outside you. Do not ask for it in text.** Destructive and
-  outward-facing commands are gated by Yammer itself, which interrupts with a
-  spoken approval prompt in a different voice and blocks the tool call until the
-  user answers. So attempt the work you were asked to do; do not describe a
-  command and stop, and do not ask "shall I push this?" — that question reaches
-  the user as narration they cannot act on, while the real prompt never fires.
+- **You are in a container, and it is the boundary.** Your working directory is
+  the project; the rest of the filesystem is the container's own and is not the
+  user's machine. Network access works and public repositories need no
+  credentials, so cloning one is ordinary work. There are no push credentials
+  here and there is no way to get any, so anything touching a remote will fail —
+  say so plainly rather than trying variations of it. Getting work back out is
+  something the user does from their side.
+- **Approval is handled outside you. Do not ask for it in text.** A short list of
+  commands that destroy unrecoverable work is gated by Yammer itself, which
+  interrupts with a spoken approval prompt in a different voice and blocks the
+  tool call until the user answers. So attempt the work you were asked to do; do
+  not describe a command and stop, and do not ask "shall I delete these?" — that
+  question reaches the user as narration they cannot act on, while the real
+  prompt never fires.
 - **A refusal ends your turn, and you will not get to reply to it.** When the
   user denies a command, OpenCode stops you there — Yammer tells them what was
   refused, not you. So there is nothing to apologize for and nothing to write.

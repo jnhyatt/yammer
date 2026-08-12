@@ -23,6 +23,7 @@ import {
   sanitizeWorkspaceName,
   workspaceMatchKey,
 } from "../lifecycle.ts";
+import type { Stakes } from "../supervisor/approval.ts";
 import { WorkspaceUnknownError, type SessionController, type WorkspaceStatus } from "../workspace.ts";
 
 /**
@@ -40,7 +41,12 @@ export interface WorkspaceLifecycle {
 
 /** What `list` reads out and what name resolution matches against. */
 export interface WorkspaceDirectory {
-  list(): ReadonlyArray<{ name: string; status: WorkspaceStatus }>;
+  /**
+   * `workDir` is the host-side path. It is here because `delete` has to be able
+   * to say what is *in* the directory it is about to destroy, and that has to
+   * come from Yammer looking rather than from anyone's description.
+   */
+  list(): ReadonlyArray<{ name: string; status: WorkspaceStatus; workDir: string }>;
 }
 
 /** The one client's active workspace. `load` is the only thing that moves it. */
@@ -81,8 +87,14 @@ export interface CommandContext {
   /**
    * Spoken approve/deny gate, in the supervisor's second voice. False means
    * don't do it — including when nobody answered.
+   *
+   * `description` is what is about to happen, in complete sentences; the
+   * supervisor adds the answer menu and, from `stakes`, a grounded clause about
+   * what is in the directory at risk. Pass the stakes rather than describing
+   * the contents here: the whole point is that the sentence comes from Yammer
+   * looking at the host directory at the moment of asking.
    */
-  confirm(question: string): Promise<boolean>;
+  confirm(description: string, stakes?: Stakes | null): Promise<boolean>;
 }
 
 export interface MetaCommand {
@@ -260,10 +272,11 @@ export const META_COMMANDS: readonly MetaCommand[] = [
 
       // The most destructive thing in the system, reached by a routing model's
       // reading of an imperfect transcript. It does not happen without a spoken
-      // yes — and silence is a no.
+      // yes — and silence is a no. The supervisor adds what is in there.
       const approved = await context.confirm(
         `This deletes the ${spoken} workspace and everything in its directory, ` +
-          `and it cannot be undone. Say approve or deny.`,
+          `and it cannot be undone.`,
+        { directory: workspace.workDir, scope: "everything" },
       );
       // The supervisor has already said what it is doing, either way.
       if (!approved) return "";
@@ -350,7 +363,9 @@ function requireHeardName(context: CommandContext): string {
  * name that does not resolve is at least as likely to be a mishearing as an
  * intention, and guessing means deleting or filling the wrong project.
  */
-function resolveWorkspace(context: CommandContext): { name: string; status: WorkspaceStatus } {
+function resolveWorkspace(
+  context: CommandContext,
+): { name: string; status: WorkspaceStatus; workDir: string } {
   const name = requireHeardName(context);
   const key = workspaceMatchKey(name);
   const workspace = context.registry

@@ -8,8 +8,8 @@ supervising several per-project OpenCode containers.
 Read the requirements doc first. This file is *how* and *in what order*, not
 *what* or *why* — where the two disagree, the requirements doc wins.
 
-**Progress: phases 0–4 are done.** Each phase below carries its own status,
-including what was deviated from and why. Phase 5 is unstarted.
+**Progress: phases 0–5 are done**, and so is the cleanup below. Each phase
+carries its own status, including what was deviated from and why.
 
 ## Where v1 was
 
@@ -47,7 +47,7 @@ are additive.
 | 2 | Container lifecycle behind a runtime interface | 1 | **done** |
 | 3 | Workspace meta-commands + router argument extraction | 2 | **done** |
 | 4 | Multi-client, per-client active workspace, protocol v3 | 3 | **done** |
-| 5 | Supervisor generalization + permission policy rework | 3 | not started |
+| 5 | Supervisor generalization + permission policy rework | 3 | **done** |
 
 Phase 5 depends on 3, not 4 — it can land in parallel with multi-client work.
 
@@ -482,7 +482,7 @@ container. No prompt was forwarded, so that cost no model tokens.
 
 ---
 
-## Phase 5 — supervisor generalization and permission policy
+## Phase 5 — supervisor generalization and permission policy ✅
 
 - **Make the supervisor source-agnostic.** It currently takes an OpenCode
   `PermissionRequest` — id, permission name, patterns, an `always` field. A
@@ -504,6 +504,54 @@ container. No prompt was forwarded, so that cost no model tokens.
 
 **Done when:** `keywords.test.ts` still passes, a workspace delete prompts and
 settles by voice, and a denied delete leaves the workspace intact.
+
+### What landed
+
+[`supervisor/approval.ts`](server/src/supervisor/approval.ts) is the abstraction:
+an `ApprovalRequest` is a description, an optional pattern that "always" would
+widen to, an optional directory whose contents are at stake, and a `settle`.
+`agentApproval` and `yammerApproval` are the two adapters, and
+`PermissionSupervisor.handle` and `.confirm` collapsed into one `approve()` that
+never branches on where a request came from. Phase 3's `confirm` was the second
+implementation this merges, exactly as planned.
+
+[`git.ts`](server/src/git.ts) is the grounding: real `git status` and a real
+count of commits on no remote, run by Yammer against the host-side directory,
+turned into one clause. The agent's ask-list was rewritten for the sandbox
+framing — thirteen entries down to seven, all of them the "don't delete
+everything" class.
+
+Decisions worth knowing:
+
+- **Every sentence the supervisor says now comes from `speech.ts`, including
+  the answer menu.** A caller used to pass a whole question, which meant
+  `delete` spelled out "say approve or deny" itself. One place decides which
+  answers are on offer, so a request with nothing to remember cannot invite an
+  "always" — and a heard "always" there settles as `once`, because reporting
+  `always` would tell the user they had configured something that does not
+  exist.
+- **Agent requests always carry the workspace directory**, rather than a second
+  list deciding which commands deserve a grounded clause. The ask-list *is* the
+  work-destroying list now, so a predicate over it would be the same list
+  written twice, and drift between them would be silent.
+- **The stakes clause is scoped.** Unpushed commits are spoken only when the
+  directory itself is going; a `reset --hard` leaves the history alone and
+  saying otherwise is noise at the one prompt that must stay worth hearing.
+  Nothing is said at all when nothing is at stake.
+- **Pushes, publishes and releases came *off* the ask-list.** There are no
+  credentials in the container, so they fail on their own; gating them spends a
+  ~10s spoken round trip to authorise an error. What stayed is recursive and
+  forced `rm`, `git reset --hard`, `clean`, `checkout --`, `restore`, and
+  `branch -D`.
+- **`git.ts` fails soft, every way it can.** No git, no directory, a repository
+  with no commits — each produces a shorter question, never a failed prompt.
+- No new config, no new dependencies.
+
+**Verified:** 217/217 tests (35 new: 15 in `git.test.ts` against real
+repositories in temporary directories, 17 in `supervisor/approval.test.ts`,
+three more in the command and socket suites), and a clean typecheck. The live
+voice check ran after the cleanup below, so that it exercised the final wiring
+rather than a state that lasted one commit.
 
 ---
 

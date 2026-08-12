@@ -131,13 +131,15 @@ the sentence the user is guaranteed to hear.
 
 Two things about it are load-bearing and easy to undo by accident:
 
-- **Its permissions are all `allow`, deliberately.** A permission set to `ask`
-  would hang the turn forever: the user has no keyboard and OpenCode has no way
-  to put the question into their earbud. The judgment that a prompt would
-  normally buy is pushed into the agent's own instructions, which tell it to
-  describe destructive or outward-facing actions and stop rather than run them.
-  `external_directory` is `deny`, preserving the directory scoping that
-  `YAMMER_PROJECT_DIR` sets up.
+- **Its permissions are `allow` except for a short list, deliberately.** The
+  container is the safety boundary, so inside it the agent gets an ordinary
+  shell. What stays behind an `ask` is the handful of commands that destroy
+  unrecoverable work through the bind mount — recursive or forced `rm`,
+  `git reset --hard`, `clean`, `checkout --`, `restore`, `branch -D` — because
+  the working directory is a real host directory and no sandbox undoes that.
+  Commands that need credentials are not on the list: there are none in the
+  container, so they fail by themselves. `external_directory` is `deny`, which
+  is what keeps the agent inside the project directory.
 - **OpenCode reads agent files once at boot and does not hot-reload them.** After
   editing the agent, restart `opencode serve` or nothing changes. The server logs
   `opencode agent available` at startup when the agent resolves, and warns if it
@@ -156,20 +158,40 @@ Both locations are valid (`.opencode/agent/` and `.opencode/agents/` are
 accepted, project-scoped merging over global). To fall back to OpenCode's default
 agent — expect screen formatting read aloud — set `YAMMER_OPENCODE_AGENT=build`.
 
-### Permission supervisor
+### Supervisor
 
-Destructive commands are gated by a spoken approval prompt in a second voice.
-The flow is: OpenCode blocks the tool call and publishes `permission.asked`,
-`src/supervisor/` says what is about to happen, the user answers with one word,
-and the call is unblocked or refused.
+Destructive things are gated by a spoken approval prompt in a second voice. The
+flow is: something asks, `src/supervisor/` says what is about to happen, the user
+answers with one word, and it is settled either way.
 
-Which commands prompt is **not** configured here — it lives in the agent's own
-permission rules in [`.opencode/agent/yammer.md`](../.opencode/agent/yammer.md),
-because that is where OpenCode reads it. Keep the list short: every entry costs
-a ~10 second spoken round trip, so it covers things that leave the machine,
-destroy work, or rewrite history, and nothing else.
+**Two things ask, and the supervisor cannot tell them apart.** OpenCode blocks a
+tool call and publishes `permission.asked`; or Yammer itself is about to do
+something irreversible outside any container, which today means a workspace
+`delete`. Both arrive as an `ApprovalRequest`
+([`src/supervisor/approval.ts`](src/supervisor/approval.ts)) — something to say,
+optionally a pattern "always" would widen to, optionally a directory whose
+contents are at stake, and a way to settle it. Everything source-specific is in
+the two adapters and in `speech.ts`; the ask-listen-settle loop never branches on
+where a request came from. Adding a third source means writing an adapter, not
+touching the loop.
 
-Three behaviours worth knowing before changing any of it:
+Which agent commands prompt is **not** configured here — it lives in the agent's
+own permission rules in
+[`.opencode/agent/yammer.md`](../.opencode/agent/yammer.md), because that is
+where OpenCode reads it. Keep the list short: every entry costs a ~10 second
+spoken round trip, and the container is what makes the list short in the first
+place.
+
+**What the prompt says about state, Yammer looked at itself.** Before asking, it
+runs real `git` against the host-side working directory
+([`src/git.ts`](src/git.ts)) and adds one clause: uncommitted changes, untracked
+files, and — when the directory itself is going — commits that are on no remote.
+A delete of an empty workspace and a delete of a week's work must not sound the
+same. The observation never comes from the container: a summary written by the
+thing being supervised is not evidence. It fails soft, and says nothing when
+there is nothing to say, so that the clause stays worth hearing.
+
+Four behaviours worth knowing before changing any of it:
 
 - **A denial ends the turn.** OpenCode does not resume the model loop after a
   rejected tool call — the assistant message finishes with no text at all
@@ -187,6 +209,10 @@ Three behaviours worth knowing before changing any of it:
   generalizes: answering "always" to `git push origin main --force` saves the
   pattern `git push *`. The supervisor reads that pattern out loud on the first
   ask for exactly that reason.
+- **An answer is never offered where it has nowhere to go.** Yammer's own
+  actions have no pattern to remember, so the menu is "approve or deny" and a
+  heard "always" settles as a one-time yes rather than reporting `always` — which
+  would tell the user they had configured something that does not exist.
 
 Answer matching is in `src/supervisor/keywords.ts` — a pure function with no
 model behind it, and the one part of this repo with real unit tests
@@ -336,7 +362,10 @@ two workspaces nobody can use.
 
 **`delete` goes through the supervisor**, in its second voice, and silence is a
 no. It is the most destructive thing in the system and it is triggered by the
-least reliable input in it.
+least reliable input in it. The prompt says what is in the directory — Yammer's
+own `git status` of it, not the workspace's account of itself — because "delete
+space game" has to sound different when space game holds a week of uncommitted
+work.
 
 **The active workspace is per connection.** Several clients may be connected at
 once, each in its own workspace, and nothing one client says moves another. Two
@@ -362,6 +391,7 @@ src/
   ws-server.ts        handshake, framing, connection lifecycle
   turn.ts             turn state machine: STT → route → act → speak
   workspace.ts        projects, and the sessions clients hold in them
+  git.ts              what is actually at stake in a working directory
   wav.ts              PCM/WAV helpers
   stt/groq.ts         OpenAI-compatible transcription
   container/runtime.ts     what Yammer needs from a container runtime
@@ -374,8 +404,9 @@ src/
   opencode/client.ts  the HTTP client for one workspace's OpenCode
   opencode/permissions.ts  watches for blocked tool calls, answers them
   supervisor/supervisor.ts spoken approval prompt in a second voice
+  supervisor/approval.ts   what gets approved, whoever asked for it
   supervisor/keywords.ts   approve/always/deny matching (pure, tested)
-  supervisor/speech.ts     turns a shell command into something hearable
+  supervisor/speech.ts     every sentence the supervisor says
   tts/kokoro.ts       sentence-chunked streaming synthesis
 ```
 
@@ -412,6 +443,12 @@ it guards a **silent** failure. Most of this repo fails loudly — a bad model i
   every failure kind reads out differently, that `load` never creates, and that
   a denied `delete` deletes nothing. All three are silent in the only way that
   counts here — they typecheck, log nothing, and are wrong out loud.
+- `supervisor/approval.test.ts` — what the user was asked and what their answer
+  did: that "always" is never offered where nothing can be remembered, and that
+  an unreachable OpenCode still leaves the agent stopped.
+- `git.test.ts` — the grounded clause, against real repositories in temporary
+  directories. A fake `git` would only prove this module agrees with someone's
+  memory of porcelain output, which is exactly the thing that would be wrong.
 
 ## Evaluating router models
 

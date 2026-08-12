@@ -26,6 +26,7 @@ import { before, describe, it } from "node:test";
 
 import { LIFECYCLE_FAILURES, WorkspaceLifecycleError } from "../lifecycle.ts";
 import { setLogLevel } from "../log.ts";
+import type { Stakes } from "../supervisor/approval.ts";
 import { WorkspaceUnknownError, type WorkspaceStatus } from "../workspace.ts";
 import {
   findCommand,
@@ -42,14 +43,15 @@ interface Recorded {
   createdWith: string[];
   loaded: string[];
   deleted: string[];
-  asked: string[];
+  /** Each spoken gate: what it described, and what it declared at stake. */
+  asked: Array<{ description: string; stakes: Stakes | null }>;
   active: string;
 }
 
 interface Setup {
   argument: string;
   /** The registry the command sees. Defaults to one ready workspace. */
-  workspaces?: Array<{ name: string; status: WorkspaceStatus }>;
+  workspaces?: Array<{ name: string; status: WorkspaceStatus; workDir?: string }>;
   active?: string;
   /** What the spoken gate answers. Defaults to deny — silence is a no. */
   approve?: boolean;
@@ -58,7 +60,9 @@ interface Setup {
 }
 
 function harness(setup: Setup): { context: CommandContext; recorded: Recorded } {
-  const workspaces = setup.workspaces ?? [{ name: "space-game", status: "ready" as const }];
+  const workspaces = (setup.workspaces ?? [{ name: "space-game", status: "ready" as const }]).map(
+    (workspace) => ({ workDir: `/workspaces/${workspace.name}`, ...workspace }),
+  );
   const recorded: Recorded = {
     said: [],
     createdWith: [],
@@ -102,8 +106,8 @@ function harness(setup: Setup): { context: CommandContext; recorded: Recorded } 
     say: async (text) => {
       recorded.said.push(text);
     },
-    confirm: async (question) => {
-      recorded.asked.push(question);
+    confirm: async (description, stakes) => {
+      recorded.asked.push({ description, stakes: stakes ?? null });
       return setup.approve === true;
     },
   };
@@ -316,10 +320,24 @@ describe("delete_workspace", () => {
   it("says what is about to be destroyed, and that it cannot be undone", async () => {
     const { context, recorded } = harness({ argument: "space game", approve: false });
     await command("delete_workspace").run(context);
-    const question = recorded.asked[0]!;
-    assert.match(question, /space game/);
-    assert.match(question, /cannot be undone/);
-    assert.match(question, /approve or deny/);
+    const asked = recorded.asked[0]!;
+    assert.match(asked.description, /space game/);
+    assert.match(asked.description, /cannot be undone/);
+    // The answer menu is the supervisor's to append — a command that spelled it
+    // out itself could offer an answer the supervisor does not accept.
+    assert.doesNotMatch(asked.description, /approve or deny/);
+  });
+
+  it("points the gate at the directory it is about to destroy", async () => {
+    // Without this the prompt cannot say what is in there, and "delete space
+    // game" sounds identical whether the directory is empty or holds a week of
+    // uncommitted work.
+    const { context, recorded } = harness({ argument: "space game", approve: false });
+    await command("delete_workspace").run(context);
+    assert.deepEqual(recorded.asked[0]!.stakes, {
+      directory: "/workspaces/space-game",
+      scope: "everything",
+    });
   });
 
   it("deletes once approved", async () => {

@@ -29,7 +29,7 @@ import { log } from "./log.ts";
 import { OpenCodeClient, type UsageStats } from "./opencode/client.ts";
 import { PermissionWatcher, type PermissionRequest } from "./opencode/permissions.ts";
 import type { WorkspaceRecord } from "./registry/store.ts";
-import type { PermissionContext } from "./supervisor/supervisor.ts";
+import type { PermissionContext } from "./supervisor/approval.ts";
 
 /**
  * Where a workspace is in its lifecycle.
