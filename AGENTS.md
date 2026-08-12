@@ -271,6 +271,14 @@ Notes here should be things that cost someone time.
   "Promise resolution is still pending but the event loop has already
   resolved", which does not point anywhere near the cause. Check `readyState`
   first. The same trap applies to any `once` on an event that may have fired.
+- **Record a refusal before acting on it, not after.** Settling a rejected
+  permission stops the agent, which makes its blocked `prompt()` fail *at once*
+  — and `TurnManager` reads `supervisor.wasDenied()` the moment that happens, to
+  tell an expected empty reply from a real OpenCode failure. Setting the flag
+  after settling loses that race and the turn ends `error` with "OpenCode
+  returned an empty response" instead of `denied`, so the user is told the
+  system broke rather than that they said no. Found in a live run, not by a
+  test; `ws-server.test.ts` now has the fast reproduction.
 - **An unanswered permission prompt keeps the process alive for the full
   timeout.** The supervisor's answer window is a `setTimeout` per attempt, and
   it reprompts, so a test that asserts on `permission.ask` and then walks away

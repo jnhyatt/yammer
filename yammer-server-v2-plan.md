@@ -547,11 +547,22 @@ Decisions worth knowing:
   with no commits — each produces a shorter question, never a failed prompt.
 - No new config, no new dependencies.
 
-**Verified:** 217/217 tests (35 new: 15 in `git.test.ts` against real
-repositories in temporary directories, 17 in `supervisor/approval.test.ts`,
-three more in the command and socket suites), and a clean typecheck. The live
-voice check ran after the cleanup below, so that it exercised the final wiring
-rather than a state that lasted one commit.
+**What the live run found, which is what it is for:** a race the tests could not
+see, because they never aborted a real in-flight prompt. `settle` recorded the
+refusal *after* acting on it — but acting on it stops the agent, which makes the
+blocked `prompt()` fail immediately, and `TurnManager` reads `wasDenied()` the
+moment that happens. So a refused tool call ended the turn as `error`, saying
+"OpenCode returned an empty response": the user is told the system broke rather
+than that they said no. The flag is now set before settling, `ws-server.test.ts`
+has a fast reproduction (it fails against the previous ordering), and the
+gotcha is in AGENTS.md. The live run also caught "1 commit that aren't on any
+remote", which no test noticed because no test listened to it.
+
+**Verified:** 222/222 tests (36 new: 15 in `git.test.ts` against real
+repositories in temporary directories, 17 in `supervisor/approval.test.ts`, four
+more in the command and socket suites), a clean typecheck, and the live voice
+run described under the cleanup below — run after it, so that it exercised the
+final wiring rather than a state that lasted one commit.
 
 ---
 
@@ -616,9 +627,47 @@ The socket tests grew a `TestClient.enter()` that runs a real `load` turn, since
 a test that forwards now has to say where first. That is more setup per test and
 also more honest: the connect-then-load flow is what a real client does.
 
-**Verified:** 221/221 tests (4 new), clean typecheck, `protocol.test.ts` green
-against the unchanged fixture (the Python client enumerates no error codes, so
-there was nothing to regenerate), and the live run below.
+**Verified:** 222/222 tests, clean typecheck, `protocol.test.ts` green against
+the unchanged fixture (the Python client enumerates no error codes, so there was
+nothing to regenerate), and the live run below.
+
+### The live run, covering both
+
+**26 checks, 26 passed**, against the real stack: utterances synthesized with
+Kokoro, sent as ordinary audio frames through real Groq STT, the real routing
+model and real Podman, with every reply *transcribed back*, so the assertions
+are on what a person would hear. In order:
+
+- A client that has said nothing about workspaces asks a question and is told
+  "You're not in a workspace yet. Say load and the name to enter one, or list
+  workspaces to hear what there is." — `no_workspace`, nothing forwarded.
+- "Create a workspace called Space Game" → a real container, and "Created space
+  game. It's empty and stopped. Say load space game to start it."
+- "Load Space Game" → "Starting up space game, one sec." then, 13 seconds later,
+  "You're in space game."
+- A real `git init`, one commit, one modified file and two untracked ones put in
+  the workspace directory on the host.
+- "Delete the Space Game workspace" → **"This deletes the space game workspace
+  and everything in its directory, and it cannot be undone. There are
+  uncommitted changes in 1 file, 2 untracked files, and 1 commit that isn't on
+  any remote. Say approve or deny."** Every number in that sentence came from
+  Yammer running git against the directory a second earlier. A spoken "deny"
+  settles it as `reject`, the workspace and its directory survive.
+- The same again, answered "approve": deleted, directory gone, and the client
+  that was in it lands *nowhere* rather than somewhere else — the next utterance
+  gets `no_workspace` again.
+
+The agent-sourced half was verified in an earlier run of the same script rather
+than the final one: prompted to `rm -rf` a directory, the container's OpenCode
+asked, and the supervisor said **"The agent wants to run rm flag r f slash
+workspace slash notes and then ls flag l a slash workspace. Saying always allows
+anything matching rm star from now on. There are uncommitted changes in 1 file
+and 2 untracked files. Say approve, always, or deny."** — the merged path, the
+widened `always`, the grounded clause, and history correctly left out of a
+working-tree action. That run is also where the refusal-ordering race surfaced.
+On the final run the model simply did not reach a gated command inside the
+timeout, which is model variance rather than a result; the deterministic
+coverage of that path is in `ws-server.test.ts`.
 
 ## Risks worth naming
 

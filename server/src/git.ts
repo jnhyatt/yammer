@@ -113,7 +113,12 @@ export function stakesSentence(tree: WorkingTree, scope: StakesScope): string | 
   // the tree leaves the history alone, so saying it there is noise.
   if (scope === "everything" && tree.kind !== "empty" && tree.kind !== "unknown") {
     const unpushed = tree.unpushed;
-    if (unpushed > 0) parts.push(`${count(unpushed, "commit")} that aren't on any remote`);
+    if (unpushed > 0) {
+      // Spoken aloud, so the verb has to agree: "1 commit that aren't on any
+      // remote" is the sort of thing a person notices and a test does not.
+      const verb = unpushed === 1 ? "isn't" : "aren't";
+      parts.push(`${count(unpushed, "commit")} that ${verb} on any remote`);
+    }
   }
 
   if (parts.length === 0) return null;

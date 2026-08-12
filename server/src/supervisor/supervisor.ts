@@ -190,16 +190,23 @@ export class PermissionSupervisor {
     response: PermissionResponse,
     speakOutcome: boolean,
   ): Promise<boolean> {
+    const approved = response === "once" || response === "always";
+    // Recorded *before* settling, not after. Settling a refusal stops the agent,
+    // which makes its blocked `prompt()` fail immediately — and the turn manager
+    // reads this the moment that happens, to tell an expected empty reply from a
+    // real OpenCode failure. Setting it afterwards is a race that loses about
+    // half the time, and loses silently: the turn ends `error` with "OpenCode
+    // returned an empty response" instead of `denied`.
+    //
+    // Only the agent's turn can be ended by a refusal; a refused workspace
+    // delete leaves the turn perfectly healthy and still owing a sentence.
+    if (!approved && request.source === "agent") this.deniedTurn = turn;
+
     try {
       await request.settle(response);
     } catch (cause) {
       log.error("could not settle an approval", { id: request.id, error: String(cause) });
     }
-
-    const approved = response === "once" || response === "always";
-    // Only the agent's turn can be ended by a refusal; a refused workspace
-    // delete leaves the turn perfectly healthy and still owing a sentence.
-    if (!approved && request.source === "agent") this.deniedTurn = turn;
 
     this.sink.send({ t: "permission.resolved", turn, id: request.id, response });
 

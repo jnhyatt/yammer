@@ -184,9 +184,10 @@ describe("stakesSentence", () => {
       { kind: "dirty", changed: 1, untracked: 0, unpushed: 1 },
       "everything",
     )!;
+    // Spoken, so the verb agrees with the count too.
     assert.equal(
       sentence,
-      "There are uncommitted changes in 1 file and 1 commit that aren't on any remote.",
+      "There are uncommitted changes in 1 file and 1 commit that isn't on any remote.",
     );
   });
 
