@@ -4,10 +4,11 @@ The second client. Same job as [`client/`](../client): wake-word detection,
 capture, earcons, playback — no STT, no TTS, no LLM calls, all of which stay on
 the server.
 
-**Status: Phase 2.** The feature pipeline and the earcons exist and are pinned to
-golden vectors, and there is an APK that plays the earcons and records a WAV —
-but nothing speaks the protocol yet, so it is a diagnostic tool rather than a
-client. `Protocol` and the state machine arrive in Phases 3–4. See
+**Status: Phase 3.** The feature pipeline, the earcons, the protocol and the turn
+state machine all exist and are pinned to fixtures, and the client has been
+driven end to end against the *real* TypeScript server over a real socket. What
+does not exist yet is the Android wiring that starts one: the APK is still the
+audio harness, and the service, the config and the UI are Phase 4. See
 [`android-client-plan.md`](../android-client-plan.md).
 
 ## Requirements
@@ -62,9 +63,13 @@ rather than judged by ear.
 | `core/WakeWordDetector.kt` | `client/src/yammer_client/wakeword.py` |
 | `core/SpeechGate.kt` | `client/src/yammer_client/vad.py` |
 | `core/Earcons.kt` | `client/src/yammer_client/earcons.py` |
+| `core/Protocol.kt` | `client/src/yammer_client/protocol.py` |
+| `core/YammerClient.kt` | `client/src/yammer_client/app.py` — the turn state machine |
 | `core/Onnx.kt` | new — model loading and tensor plumbing |
 | `core/Wav.kt` | new — RIFF read/write, for getting captures off the phone |
+| `core/WebSocketTransport.kt` | new — OkHttp, and the thread it calls back on |
 | `app/AudioIo.kt` | `client/src/yammer_client/audio.py` |
+| `app/TrackSpeaker.kt` | new — `core`'s `Speaker` on a real `AudioTrack` |
 | `app/AudioCheckActivity.kt` | new — the audio harness |
 
 The right-hand column is load-bearing: a change to the Python client's detection
@@ -74,8 +79,8 @@ behaviour has an obvious counterpart here.
 
 ```sh
 cd android
-./gradlew :core:test                 # 53 JVM tests, no SDK or device needed
-./gradlew :app:assembleDebug         # 9.4 MB APK
+./gradlew :core:test                 # 98 JVM tests, no SDK or device needed
+./gradlew :app:assembleDebug         # 11.3 MB APK
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
@@ -83,6 +88,12 @@ The tests need no arguments and no network. They read the models from
 `android/models/` and the golden vectors from `../fixtures/`, both passed in as
 system properties by `core/build.gradle.kts` — running them from an IDE without
 those properties fails with a message saying so.
+
+One test is different: `ServerConformanceTest` spawns
+[`server/tools/fake-server.ts`](../server/tools/fake-server.ts) and drives the
+real client against the real server. It needs `node` on `PATH` and
+`server/node_modules` present, and **skips itself with a reason** if either is
+missing rather than failing. Everything else runs anywhere a JVM does.
 
 ## The audio check
 
@@ -131,6 +142,43 @@ cliff frequency. Both verdicts are checked against known inputs — it passes
 `fixtures/wakeword/input.wav` and fails a deliberately band-limited copy of it at
 3406 Hz. `--plot` writes the spectrum as a PNG if matplotlib is around.
 
+## The protocol and the state machine
+
+`core/Protocol.kt` is the fourth view of
+[`protocol/PROTOCOL.md`](../protocol/PROTOCOL.md), alongside the server's
+`protocol.ts` and the desktop client's `protocol.py`. **All four change
+together** — a mismatch will not show up as a type error.
+
+Two tests check that, and they fail on different mistakes.
+
+`ProtocolTest` checks the **codecs** against
+`fixtures/protocol/client-frames.json`, which is dumped from the real Python
+module and decoded by the server's own suite as well. The comparison is on parsed
+JSON, not bytes: Python's `json.dumps` writes `{"t": "hello", …}` and kotlinx
+writes `{"t":"hello",…}`, and insignificant whitespace is not the contract. What
+is compared is everything a parser preserves — the key set, the values and their
+JSON types, which is where `"2"` versus `2` lives. One field is asserted *not* to
+match: `client` is how a line in the server's log gets attributed to a device, so
+this client sends `yammer-android/0.1.0` and the test says so.
+
+`ServerConformanceTest` checks the **sequence**, by running the real client
+against the real server over a real socket. The server is
+`server/tools/fake-server.ts`: the genuine `startServer`, handshake,
+`TurnManager` and `PermissionSupervisor`, with fakes only for STT, the router,
+OpenCode and Kokoro. A turn round-trips and a permission prompt is answered by
+voice. Its fake STT reports how many bytes it was handed, so the transcript frame
+becomes an assertion on the whole audio path: 20 blocks buffered, 8 trimmed by
+the stop-word trim, 30720 bytes received.
+
+To drive a client at it by hand — from a phone, once there is one to drive:
+
+```sh
+cd server && node --experimental-strip-types tools/fake-server.ts --port 8765
+```
+
+Its token is `s3cret-token`, it asks for permission on the second turn of a
+session, and it needs no `.env`, no API keys and no OpenCode.
+
 ## The models
 
 `models/` holds the five ONNX files openWakeWord downloads on the desktop:
@@ -155,7 +203,7 @@ second copy.
 
 ## What the tests actually check
 
-`:core:test` is 53 tests, and the ones that matter reproduce
+`:core:test` is 98 tests, and the ones that matter most reproduce
 [the golden vectors](../fixtures/README.md) — `wakeword/golden.json`, generated by
 the Python client and cross-checked against the real `openwakeword.Model` before
 it was written, and `earcons/golden.json`, generated from the Python client's own
@@ -192,6 +240,16 @@ Two details the fixture pins that are easy to get wrong and give no other signal
   `hey_jarvis`, `onnx::Flatten_0` for `alexa`, both just whatever the exporter
   emitted. `WakeWordModel` reads `session.inputNames.first()`; hardcoding either
   works for exactly one model.
+
+The rest of the suite is the protocol and the turn state machine.
+`YammerClientTest` drives the machine from scripted wake-word and VAD scores,
+which is the only way to arrange the cases that actually matter in it — a second
+start word mid-utterance, a permission ask arriving while the user is still
+talking, an utterance shorter than the stop-word trim, an answer that has to
+carry its pre-roll without duplicating the block that triggered onset. Real audio
+cannot be relied on to produce any of those on cue. See
+[the protocol section](#the-protocol-and-the-state-machine) for the two
+conformance tests.
 
 One deliberate deviation from the library, in `AudioFeatures`: `reset()` restores
 a cached silence seed instead of recomputing it. openWakeWord's `Model.reset()`

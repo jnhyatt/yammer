@@ -1,18 +1,25 @@
 # Yammer — Android Client Implementation Plan
 
-> **Status: Phases 0, 1 and 2 complete.** The feature pipeline and the earcons
-> exist in Kotlin and reproduce their golden vectors; there is an APK that plays
-> the earcons and records a WAV, but no client yet — nothing speaks the protocol.
+> **Status: Phases 0–3 complete, except the parts that need a device.** There is
+> a client now: it speaks the protocol, runs the turn state machine, and has been
+> driven end to end against the *real* TypeScript server over a real socket — a
+> turn round-trips and a permission prompt is answered by voice. What has not
+> happened is any of it on a phone, because the wiring that starts a client from
+> an Android service belongs to Phase 4 along with the config it needs.
 > Written 2026-08-11 after a feasibility dig through `client/` and openWakeWord's
-> internals; Phases 0 and 1 executed the same day, Phase 2 on 2026-08-12.
+> internals; Phases 0 and 1 executed the same day, Phases 2 and 3 on 2026-08-12.
 > Supersedes the "Mobile client" entry on the requirements doc's non-goals list,
 > now amended as §9 — see [Doc changes](#doc-changes-required).
 >
-> **Phase 2's done-when is half machine-checkable and half not.** The earcon
-> arithmetic is pinned to a fixture and agrees with Python *exactly*; whether the
-> five are audible and distinguishable through the target earbuds is a judgement
-> that needs the earbuds. The APK exists to make that judgement, and to answer
-> the capture-bandwidth question with a measurement rather than an opinion.
+> **Two done-whens are outstanding, both device-gated.** Phase 2's asks whether
+> the five earcons are distinguishable through the target earbuds and what the OS
+> actually gives us as a capture stream; `AudioCheckActivity` and
+> `tools/check_capture.py` exist to answer both, and neither has been run on
+> hardware. Phase 3's asks for a real utterance from the phone. The residual risk
+> in the second one is smaller than it looks: everything between the socket and
+> the state machine is now covered by `ServerConformanceTest`, so what is left
+> untested is `AudioRecord` → client and client → `AudioTrack`, both of which are
+> Phase 2 code that `AudioCheckActivity` already exercises.
 
 ## Verdict
 
@@ -77,7 +84,10 @@ android/
       Onnx.kt                   model loading and tensor plumbing
       Earcons.kt                ← client/src/yammer_client/earcons.py   ✅
       Wav.kt                    RIFF read/write, for getting captures off the phone  ✅
-    src/test/kotlin/            golden-vector tests — desktop JVM, no emulator
+      Protocol.kt               ← client/src/yammer_client/protocol.py   ✅
+      YammerClient.kt           ← client/src/yammer_client/app.py        ✅
+      WebSocketTransport.kt     OkHttp, and the thread it calls back on   ✅
+    src/test/kotlin/            golden-vector, state-machine and interop tests — desktop JVM
   app/                          ✅ Phase 2
     build.gradle.kts
     src/main/
@@ -86,14 +96,23 @@ android/
       kotlin/dev/yammer/android/
         AudioIo.kt              ← client/src/yammer_client/audio.py     ✅
         AudioCheckActivity.kt   the audio harness, and a permanent diagnostic  ✅
+        TrackSpeaker.kt         core's Speaker on a real AudioTrack      ✅
         MainActivity.kt         (Phase 4) permission request, start/stop, log view
         YammerService.kt        (Phase 4) foreground service, type=microphone
         Config.kt               (Phase 4) ← client/src/yammer_client/config.py
-        Protocol.kt             (Phase 3) ← client/src/yammer_client/protocol.py
-        YammerClient.kt         (Phase 3) ← client/src/yammer_client/app.py
   tools/
     check_capture.py            spectrum verdict on a pulled WAV  ✅
 ```
+
+**Amended in Phase 3: `Protocol.kt`, `YammerClient.kt` and `WebSocketTransport.kt`
+are in `core`, not `app`** — the same rule as the earcons, applied to the two
+files the plan had put in the app. Neither needs Android: the protocol is string
+and byte handling, the state machine is a switch over events, and OkHttp is the
+WebSocket on the desktop as well as the phone. Putting them in `core` is what
+makes `ServerConformanceTest` possible at all, and that test is worth more than
+the tidiness of having the client live next to the service that will start it.
+`app` keeps the two adapters that genuinely touch the platform: `AudioIo.kt` and
+`TrackSpeaker.kt`.
 
 **Amended in Phase 2: `Earcons.kt` moved to `core`**, for Phase 1's reason — it
 is pure arithmetic, and in `core` it is checked against a fixture instead of by
@@ -129,8 +148,13 @@ a protocol change has an obvious checklist.
 - `com.microsoft.onnxruntime:onnxruntime` (JVM, `testImplementation` only) — lets
   the feature-pipeline tests run as plain JVM unit tests against the same models
 - `org.jetbrains.kotlinx:kotlinx-coroutines-android` — capture is a `Flow`
-- `com.squareup.okhttp3:okhttp` — WebSocket (Phase 3)
-- `org.jetbrains.kotlinx:kotlinx-serialization-json` — control frames (Phase 3)
+- ✅ `com.squareup.okhttp3:okhttp` — WebSocket. In `core`, not `app`: it is the
+  transport on the desktop too, which is what lets the interop test run.
+- ✅ `org.jetbrains.kotlinx:kotlinx-serialization-json` — control frames. The
+  runtime API only; no compiler plugin and no `@Serializable` mirrors, because a
+  generated encoder would make the wire field names a consequence of Kotlin
+  property names, and the field names *are* the contract.
+- Together these took the debug APK from 9.4 MB to **11.3 MB**.
 - `androidx.datastore:datastore-preferences` — config (Phase 4)
 - ~~Compose for the (deliberately minimal) UI~~ — **not in Phase 2.** The audio
   harness is framework Views: a screen whose whole job is to tell you whether
@@ -386,14 +410,64 @@ earbuds route `TYPE_BLE_HEADSET` rather than `TYPE_BLUETOOTH_SCO`, whether the
 five earcons are distinguishable in the ear, what the barge-in flush actually
 sounds like, and the battery question below.
 
-### Phase 3 — Protocol and state machine (~2–3 days)
+### Phase 3 — Protocol and state machine ◐
 
-`Protocol.kt`, `YammerClient.kt`. A direct port of `app.py`'s
-IDLE → RECORDING → WAITING → ANSWERING machine, including the local busy
-rejection, the fixed stop-word trim, and the pre-roll on permission answers.
+`Protocol.kt`, `YammerClient.kt`, `WebSocketTransport.kt` and `TrackSpeaker.kt`.
+A direct port of `app.py`'s IDLE → RECORDING → WAITING → ANSWERING machine,
+including the local busy rejection, the fixed stop-word trim, and the pre-roll on
+permission answers. **45 new tests, 98 in the suite.**
 
-**Done when:** a real utterance reaches the real server, an OpenCode reply plays
-back, and a permission prompt can be approved by voice from the phone.
+`Protocol.kt` is the fourth view of the wire contract, and `ProtocolTest` holds
+it to `fixtures/protocol/client-frames.json` — the same frames, dumped from the
+real Python module, that `server/src/protocol.test.ts` decodes. The comparison is
+on parsed JSON rather than bytes: Python writes `{"t": "hello", …}` and kotlinx
+writes `{"t":"hello",…}`, and imitating a formatting default is not conformance.
+Everything that survives a parser *is* compared, which is where the mismatches
+that break a cross-language protocol live (`"2"` versus `2`).
+
+One field is asserted **not** to match. `client` exists so a line in the server's
+log can be attributed to a device, so this client sends `yammer-android/0.1.0`
+and the test says so rather than letting a copied constant look like agreement.
+
+**The interop test is the phase's real result.** `ServerConformanceTest` spawns
+`server/tools/fake-server.ts` — the genuine `startServer`, handshake,
+`TurnManager` and `PermissionSupervisor`, with fakes only for STT, the router,
+OpenCode and Kokoro — and drives the real Kotlin client at it over a real socket.
+A turn round-trips and a permission prompt is answered by voice, in about two
+seconds, on a desktop JVM. The fake STT reports **how many bytes it was handed**,
+which turns the transcript frame into an end-to-end assertion on the audio path:
+20 blocks buffered, 8 trimmed, 30720 bytes received.
+
+That is the substitute for the device leg, and it covers more of it than a phone
+test would have covered cheaply. The codec fixture catches a renamed field; this
+catches a bad *sequence* — frames in an order the server rejects, an utterance
+that arrives truncated, an answer that never settles. Neither finds the other's
+failures.
+
+**Four amendments:**
+
+- **The files are in `core`, not `app`** — see the layout above.
+- **The state machine takes a lock, because the two input streams are genuinely
+  concurrent here.** The desktop client gets serialization free from asyncio:
+  one task reads the microphone, another reads the socket, and the event loop
+  interleaves them. On Android capture is a `Flow` on a background dispatcher and
+  OkHttp calls back on its own reader thread, so every entry point synchronizes.
+  Wake-word inference runs inside that lock, parking the socket thread for the
+  few milliseconds a block takes — much cheaper than the bug the alternative buys.
+- **A protocol violation is a close code, not an exception.** `app.py` raises,
+  which ends the process in front of a console that says why. A phone has no
+  console, so the same event becomes the error earcon, a warning, and a
+  `4003` the server records.
+- **Turn ids wrap where PROTOCOL.md says they do.** The desktop client increments
+  a Python int forever and masks only at the framing layer, so after 2^32 turns
+  its control frames and its binary frames would disagree. Nothing reaches that
+  — one turn every ten seconds is 1360 years — but wrapping costs a line.
+
+**Done when:** ✅ the protocol matches the fixture, ✅ the state machine is
+covered case by case, ✅ a turn and a permission prompt round-trip through the
+real server — ◐ **but not yet from the phone**, which needs Phase 4's service
+and config to start a client at all. `TrackSpeaker.kt` is the adapter that will
+carry playback when it does; everything above it is done.
 
 ### Phase 4 — Service, lifecycle, config (~2 days)
 
@@ -425,7 +499,9 @@ The part that cannot be done by reading code:
 | Layer | How |
 |---|---|
 | Feature pipeline | ✅ `./gradlew :core:test` — vs. the Phase 0 golden vectors, worst divergence 4.999e-07. The one place where a subtle bug is silent: a wrong buffer offset yields scores that look reasonable and never fire. |
-| Protocol | The Phase 0 conformance check, driven against `Protocol.kt`. |
+| Protocol | ✅ `ProtocolTest` against `fixtures/protocol/client-frames.json` — the same frames dumped from the real Python module that the server's suite decodes. Compares parsed JSON, not bytes; see Phase 3 on why. |
+| Turn state machine | ✅ `YammerClientTest` — scripted wake-word and VAD scores in, recorded frames and earcons out. The cases that matter here are ones real audio cannot reliably arrange: a second start word mid-utterance, a permission ask arriving while the user is still talking, an utterance shorter than the trim. |
+| Client ↔ server interop | ✅ `ServerConformanceTest` drives the real client against the real server via `server/tools/fake-server.ts`. Catches *sequence* failures, which codec conformance cannot: frames in an order the server rejects, an utterance that arrives truncated, an answer that never settles. |
 | Earcons | ✅ Pinned to `fixtures/earcons/golden.json` — byte-identical to the Python client's, ±1 LSB allowed and unused. What a fixture cannot check is whether they are *distinguishable in the ear*, which is what `AudioCheckActivity` is for. |
 | Capture bandwidth | ✅ `android/tools/check_capture.py` on a WAV pulled from the phone. Not judgeable by ear: a band-limited stream sounds fine and has already lost what cannot be recovered. |
 | Wake-word accuracy | By use. Log every score above ~0.3 so false-negative complaints are diagnosable after the fact. |
@@ -438,6 +514,7 @@ The part that cannot be done by reading code:
 | ~~Capture silently routes to the built-in mic instead of the buds~~ | ~~Medium~~ → **instrumented** | Done in Phase 2. `AudioCapture` reports `getRoutedDevice()` at capture start and `describeDevice()` names the transport rather than printing a constant: `BLE_HEADSET (LE Audio — the supported path)` vs `BLUETOOTH_SCO (classic telephony — band-limited)` vs `BUILTIN_MIC`. A suspicion becomes a fact on first run. The *verdict* on what happens is still unmeasured. |
 | ~~Feature-pipeline port is subtly wrong~~ | ~~Medium~~ → **Low** | Retired by Phase 0. The algorithm is pinned to a fixture that a from-scratch reimplementation reproduced *exactly* (`0.0` divergence), so a Kotlin bug now surfaces as a failing JVM test rather than as a wake word that mysteriously doesn't fire. |
 | AGC pumping the noise floor causes wake-word false positives | Medium | Threshold re-tuning in Phase 5. If it persists, `UNPROCESSED` is available where `PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED` reports true — at the cost of losing AEC. |
+| **The server's answer window opens after it finishes sending the question.** `PermissionSupervisor.handle` awaits `speak()` before `collectAnswer()`, so an `answer.begin` arriving earlier is dropped, its audio falls through to a turn that is already processing and is dropped too, and the user is reprompted for an answer they gave. | Low, and **not the client's bug** | Found by `ServerConformanceTest`, which waits the supervisor out rather than working around it. Narrow in practice: sending audio is far faster than playing it, so by the time anyone has heard enough to interrupt, the window is usually open. It widens with synthesis latency and question length. The fix is on the server — open the window before speaking — and is not scheduled here. |
 | Phone battery from preventing deep sleep | Low–Medium | Measure. The cost is dominated by keeping the CPU out of deep sleep, not by the 4.6%-of-a-core inference. |
 
 ### Two gotchas that will otherwise cost an hour each
@@ -471,24 +548,29 @@ prevent. This project takes an entry off that list, so the doc changes first.
 - ✅ **`AGENTS.md`** — `fixtures/` and `client/tools/` added to the repository
   layout; the test section now describes three suites and the fixture-regeneration
   step after a protocol change.
-- ◐ **`voice-opencode-requirements.md`, second pass** — done: the headphones
-  operating assumption now carries the note that Android gets AEC and NS as a
-  side effect of the communication capture use case §9 requires, and says that
-  is a side effect to measure rather than a reason to support speakers. Still
-  outstanding: "Client (v1 = desktop app)" in § Architecture describing two
-  clients, which waits for Phase 3 — after Phase 2 there is an APK that plays
-  earcons and records audio, not a second client.
-- ◐ **`AGENTS.md`, second pass** — done: `android/`, `android/core/` and
-  `android/models/` are in the layout, `./gradlew :core:test` is in the commands,
-  and the test section describes what that suite guards. Still outstanding: the
-  note that the protocol contract has four views rather than three, due when
-  `Protocol.kt` exists (Phase 3). The `reset()` and asset-loading gotchas turned
-  out not to belong there — both are now solved in code rather than warned about
-  in prose.
+- ✅ **`voice-opencode-requirements.md`, second pass** — the headphones operating
+  assumption carries the note that Android gets AEC and NS as a side effect of
+  the communication capture use case §9 requires, and says that is a side effect
+  to measure rather than a reason to support speakers. And § Architecture now
+  describes **two clients** rather than "v1 = desktop app", which was accurate
+  only until something else spoke the protocol. It names the desktop as the
+  reference implementation and says what that means concretely: the pipeline,
+  the earcons and the frames are pinned to fixtures the Python side generates, so
+  a behaviour change there fails a Kotlin test rather than producing two clients
+  that quietly disagree.
+- ✅ **`AGENTS.md`, second pass** — `android/`, `android/core/`,
+  `android/models/` and now `server/tools/` are in the layout, the commands cover
+  `:core:test` and the fake server, and the test section describes what the suite
+  guards. The contract paragraph says **four views**, not three, and adds the
+  distinction the second conformance test creates: the fixture catches a codec
+  disagreement, the interop test catches a sequence one, and neither finds the
+  other's failures. The barge-in race is a new gotcha. The `reset()` and
+  asset-loading gotchas turned out not to belong there — both are now solved in
+  code rather than warned about in prose.
 - ◐ **`android/README.md`** — written: requirements including the YMMV hardware
-  caveat, the module split and why, build and test, the model table and what the
-  suite actually checks. The config and earcon tables follow the code that needs
-  them (Phases 4 and 2).
+  caveat, the module split and why, build and test, the audio check, the model
+  table and what the suite actually checks. The config table is the last piece
+  outstanding, and follows the code that needs it (Phase 4).
 
 ## Non-goals
 

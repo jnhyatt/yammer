@@ -23,6 +23,14 @@ data class WakeWordConfig(
     val stopModel: String = "alexa",
     val startThreshold: Double = 0.5,
     val stopThreshold: Double = 0.5,
+    /**
+     * How much audio [YammerClient] drops from the end of the buffer when the
+     * stop word fires. openWakeWord reports that a word was detected, not where
+     * it began, so this is a fixed trim rather than a precise boundary: too
+     * small and the stop word reaches OpenCode as part of the prompt, too large
+     * and it eats the end of the sentence.
+     */
+    val stopTrimSeconds: Double = 0.7,
     /** Suppresses repeat fires from one spoken wake word. */
     val refractorySeconds: Double = 1.5,
 )

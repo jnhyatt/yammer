@@ -12,8 +12,15 @@ dependencies {
     // the tests with an UnsatisfiedLinkError that looks like a code bug.
     compileOnly(libs.onnxruntime.jvm)
 
+    // The protocol and the state machine are `core` code for Phase 1's reason —
+    // they are pure logic, so a JVM test can hold them to the same fixture the
+    // server is held to. Neither dependency is Android-specific: OkHttp is the
+    // WebSocket on both sides, which is what lets `ServerConformanceTest` drive
+    // this client against the real TypeScript server from the desktop.
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.okhttp)
+
     testImplementation(libs.onnxruntime.jvm)
-    testImplementation(libs.kotlinx.serialization.json)
     testImplementation(kotlin("test"))
 }
 

@@ -27,7 +27,10 @@ The primary use case is working on a project while unable to type or look at a s
 └────────────────────────────┘         └───────────────────────────────────┘
 ```
 
-The client is deliberately thin — no STT, no TTS, no LLM calls — so future clients only reimplement audio capture, wake-word detection, and earcons.
+The client is deliberately thin — no STT, no TTS, no LLM calls — so a second
+client only reimplements audio capture, wake-word detection, earcons and the
+turn state machine. `android/` is that second client, and its existence is what
+turns "the protocol is a contract" from an intention into a checkable fact.
 
 **The two halves are in different languages on purpose** (openWakeWord is Python-native; the OpenCode SDK is TypeScript-native). This means the WebSocket protocol is a real cross-language contract, not a shared type definition. Treat protocol changes as breaking changes to both halves and keep the schema documented in one place.
 
@@ -38,6 +41,7 @@ protocol/PROTOCOL.md   the cross-language wire contract — source of truth
 server/                TypeScript. See server/README.md
 client/                Python 3.11. See client/README.md
 client/tools/          generators for the checked-in fixtures — not part of the client
+server/tools/          fake-server.ts: the real server with its networked deps faked, for other-language clients
 android/               Kotlin. Second client, in progress. See android/README.md
 android/core/          everything that is pure Kotlin — pipeline, earcons, WAV — tested on the desktop
 android/app/           the Android application; only what genuinely needs Android
@@ -54,18 +58,27 @@ android-client-plan.md           the Android client's implementation plan (§9 o
 Each half has a gitignored `.env` and a checked-in `.env.example`. `YAMMER_TOKEN`
 must be identical in both — a mismatch closes the socket with 4001.
 
-`protocol/PROTOCOL.md`, `server/src/protocol.ts`, and
-`client/src/yammer_client/protocol.py` are three views of one contract. **Change
-them together.** A mismatch between the two implementations will not show up as
-a type error — the conformance test is the only thing that checks them against
-each other, and it only can because the frames it decodes are dumped from the
-real Python module. After any protocol change, regenerate that fixture:
+`protocol/PROTOCOL.md`, `server/src/protocol.ts`,
+`client/src/yammer_client/protocol.py` and
+`android/core/src/main/kotlin/dev/yammer/core/Protocol.kt` are **four views of
+one contract. Change them together.** A mismatch between the implementations
+will not show up as a type error — the conformance tests are the only thing that
+checks them against each other, and they only can because the frames they decode
+are dumped from the real Python module. After any protocol change, regenerate
+that fixture:
 
 ```sh
 cd client && .venv/bin/python tools/dump_protocol_frames.py
 ```
 
-A diff there is the signal that the other views need the same change.
+A diff there is the signal that the other three views need the same change.
+
+Two things check the contract, and they fail on different mistakes. The fixture
+above catches a **codec** disagreement — a renamed field, a number sent as a
+string. `android`'s `ServerConformanceTest` catches a **sequence** disagreement,
+by running the real Kotlin client against the real TypeScript server over a real
+socket: frames in an order the server rejects, an utterance that arrives
+truncated, an answer that never settles. Neither finds the other's failures.
 
 ## Commands
 
@@ -86,7 +99,14 @@ cp .env.example .env         # then fill in YAMMER_TOKEN
 cd android && ./gradlew :core:test
 ./gradlew :app:assembleDebug   # needs ANDROID_HOME as a real path, not a literal ~
 adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# the fake server on its own, to drive a client by hand
+cd server && node --experimental-strip-types tools/fake-server.ts --port 8765
 ```
+
+`:core:test` spawns `server/tools/fake-server.ts` itself for its interop test and
+skips that one test if `node` or `server/node_modules` is missing. Running it by
+hand is for driving the client from somewhere else — a phone, say.
 
 Config comes from the environment, with a `.env` loaded at startup — first file
 found wins, files are never merged, and the real environment always beats the
@@ -113,9 +133,9 @@ semantics; it was verified against the real Node parser on a 13-case fixture,
 but nothing re-checks it. It guards the same class of bug as the two above —
 two implementations of one contract silently drifting apart.
 
-`cd android && ./gradlew :core:test` is the same idea in Kotlin: 53 tests that
-reproduce the golden vectors from the ported pipeline and earcons. They guard the
-two most silent failures in the system. A wake-word pipeline that is subtly wrong
+`cd android && ./gradlew :core:test` is the same idea in Kotlin: 98 tests, most
+of which reproduce the golden vectors from the ported pipeline and earcons. They
+guard the two most silent failures in the system. A wake-word pipeline that is subtly wrong
 produces plausible scores that never cross threshold, with nothing thrown and
 nothing logged; a drifted earcon still plays five plausible beeps that have
 stopped meaning what the desktop client's mean. The wake-word tolerance is 1e-6,
@@ -124,6 +144,13 @@ run the same ONNX Runtime version against the same weights; the observed worst
 case is 4.999e-07. The earcons are byte-identical. Each stage is checked
 separately, so a divergence localizes itself rather than presenting as "the score
 is wrong" or "the earcon differs".
+
+The rest of that suite is the protocol and the turn state machine. `ProtocolTest`
+holds `Protocol.kt` to the same fixture the server is held to; `YammerClientTest`
+drives the state machine from scripted wake-word and VAD scores, which is the
+only way to arrange the cases that matter in it (a second start word mid-
+utterance, a permission ask arriving while the user is still talking);
+`ServerConformanceTest` runs the whole thing against the real server.
 
 **What those tests deliberately do not cover is anything a device decides.**
 Whether the earcons are distinguishable in the ear, and whether the OS hands us a
@@ -284,6 +311,19 @@ Notes here should be things that cost someone time.
   sentence in one call still means the writer thread cannot notice it was
   flushed until that write finishes. `AudioPlayback` slices to 40 ms and tags
   each slice with a generation counter that `flush()` bumps.
+- **The server's answer window opens later than barge-in implies, and that is a
+  real gap.** `PermissionSupervisor.handle` awaits `speak(question)` *before*
+  calling `collectAnswer`, so `pending` does not exist until the last segment of
+  the question has been **sent**. An `answer.begin` arriving earlier hits a null
+  `pending` and is dropped; its audio frames then fall through to
+  `TurnManager.appendAudio`, which drops them too because the turn is already
+  `processing`. The user gets reprompted for an answer they already gave.
+  PROTOCOL.md documents barge-in as supported and both clients implement it, so
+  this is a server bug, not a client one. It is narrow in practice — sending
+  audio is far faster than playing it, so by the time anyone has heard enough to
+  interrupt, the window is usually open — and it widens with synthesis latency
+  and question length. Found by `ServerConformanceTest`, which waits the
+  supervisor out rather than working around it.
 - **OpenCode's own default model is not guaranteed to work, and the failure
   only shows up on the first forwarded turn.** `OpenCodeSession.resolveModel`
   falls back to `client.config.providers()`'s first default when

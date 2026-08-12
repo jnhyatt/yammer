@@ -11,9 +11,16 @@ This is a **functional requirements doc**, not an implementation spec. Where a s
 Client/server split, connected over a single WebSocket connection.
 
 - **Server**: hosts OpenCode, the STT client, Kokoro (TTS), and the routing LLM. Runs on an always-on machine (location TBD — not the developer's primary desktop). Talks to OpenCode locally. Written in **TypeScript**, so it can use OpenCode's official SDK natively.
-- **Client (v1 = desktop app)**: runs wake-word detection locally, captures and frames microphone audio, streams it to the server, plays back synthesized speech received from the server, and produces local audio feedback (see §7). Intentionally kept "thin" — no STT, no TTS, no LLM calls — so that future clients (mobile, etc.) only need to reimplement audio capture, wake-word detection, and earcons, not any of the intelligence. Written in **Python**, so it can use openWakeWord natively.
+- **Client**: runs wake-word detection locally, captures and frames microphone audio, sends it to the server, plays back synthesized speech received from the server, and produces local audio feedback (see §7). Intentionally kept "thin" — no STT, no TTS, no LLM calls — so that a further client only reimplements audio capture, wake-word detection, earcons and the turn state machine, not any of the intelligence.
 
-The two halves are in different languages by deliberate choice: each uses the library that is native to its job. The cost is that the WebSocket protocol is a real cross-language contract rather than a shared type definition — see §2, which raises it from an implementation detail to a specified component.
+There are now **two clients**, and the thinness above is the reason a second one was three phases of work rather than a rewrite:
+
+- **Desktop (`client/`)**, in **Python**, so it can use openWakeWord natively. Still the reference implementation: it is where behaviour is decided, and the Android client is checked against fixtures generated from *it*.
+- **Android (`android/`)**, in **Kotlin**, with the openWakeWord pipeline ported to ONNX Runtime directly rather than reimplemented. See §9 for the scope decisions and `android-client-plan.md` for the plan. Its hardware requirements are narrower than the desktop's on purpose.
+
+"Reference implementation" is a real relationship and not a courtesy: the wake-word pipeline, the earcons and the protocol frames are all pinned to fixtures that the Python side generates, so a behaviour change on the desktop shows up as a failing Kotlin test rather than as two clients that quietly disagree. What the Android client does *not* inherit is anything a device decides — routing, audio bandwidth, battery — which is what §9 is about.
+
+The two halves are in different languages by deliberate choice: each uses the library that is native to its job. The cost is that the WebSocket protocol is a real cross-language contract rather than a shared type definition — see §2, which raises it from an implementation detail to a specified component. With a third language now speaking it, that cost is paid three times and the conformance fixtures are what make it survivable.
 
 The client only operates within a specific project directory it's configured for; OpenCode's filesystem access is scoped to that directory. No remote-repo access, no credentials handling beyond the transport token (§2), no elevated permissions in v1.
 

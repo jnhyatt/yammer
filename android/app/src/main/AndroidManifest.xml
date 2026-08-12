@@ -4,11 +4,14 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!--
-      Phase 3 adds INTERNET for the WebSocket; Phase 4 adds FOREGROUND_SERVICE and
-      FOREGROUND_SERVICE_MICROPHONE, which is what capture needs once it outlives
-      a visible activity. Nothing in Phase 2 records in the background, so they
-      would be permissions asked for and not used.
+      INTERNET is the WebSocket's. It is easy to forget because it is a normal
+      permission with no prompt: the app just fails to connect.
+
+      Phase 4 adds FOREGROUND_SERVICE and FOREGROUND_SERVICE_MICROPHONE, which is
+      what capture needs once it outlives a visible activity. Nothing here records
+      in the background yet, so they would be permissions asked for and not used.
     -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
 
