@@ -8,9 +8,8 @@ supervising several per-project OpenCode containers.
 Read the requirements doc first. This file is *how* and *in what order*, not
 *what* or *why* — where the two disagree, the requirements doc wins.
 
-**Progress: phases 0, 1 and 2 are done** — the load-bearing ones. Each phase
-below carries its own status, including what was deviated from and why. Phases
-3–5 are unstarted.
+**Progress: phases 0–3 are done.** Each phase below carries its own status,
+including what was deviated from and why. Phases 4 and 5 are unstarted.
 
 ## Where v1 was
 
@@ -45,7 +44,7 @@ are additive.
 | 0 | `Workspace` handle; one workspace, from today's config | — | **done** |
 | 1 | Registry, persistence, startup reconciliation | 0 | **done** |
 | 2 | Container lifecycle behind a runtime interface | 1 | **done** |
-| 3 | Workspace meta-commands + router argument extraction | 2 | not started |
+| 3 | Workspace meta-commands + router argument extraction | 2 | **done** |
 | 4 | Multi-client, per-client active workspace, protocol v3 | 3 | not started |
 | 5 | Supervisor generalization + permission policy rework | 3 | not started |
 
@@ -330,7 +329,7 @@ about 7s, the difference being one bounded probe against that startup window.
 
 ---
 
-## Phase 3 — meta-commands and router arguments
+## Phase 3 — meta-commands and router arguments ✅
 
 - Broaden `MetaCommand.run`. Today it takes a `SessionController`
   ([`commands.ts`](server/src/router/commands.ts)); it needs a context carrying
@@ -359,6 +358,61 @@ about 7s, the difference being one bounded probe against that startup window.
 
 **Done when:** the eval passes with no critical misroutes on the expanded case
 set, and creating, loading, listing, and deleting a workspace all work by voice.
+
+### What landed
+
+[`commands.ts`](server/src/router/commands.ts) grew a `CommandContext` (the
+session, the registry, the manager, this client's active workspace, the
+extracted name, and two capabilities — `say` for speaking mid-command and
+`confirm` for the spoken gate) and the four verbs on top of it. The router's
+schema gained a `workspace` slot, filled only for the commands that declare
+`takesWorkspace`.
+
+**The supervisor gained `confirm`, which phase 5 was going to introduce.** The
+plan had `delete` behind the supervisor in this phase and the supervisor's
+source-agnostic rework in the next one, which cannot both be true. So `confirm`
+reuses the answer window, the keyword matcher and the second voice while
+staying separate from `handle`: it has no OpenCode request to reply to and no
+pattern for "always" to widen to. Phase 5 still merges them; what it no longer
+has to do is *introduce* the gate, and `delete` is not left ungated in the
+meantime.
+
+Decisions worth knowing:
+
+- **Names resolve on a key with every separator stripped**, not on the
+  hyphenated sanitized name. This is the one thing the live run changed:
+  Whisper returned "LiveCheck" when the workspace was created and "live check"
+  when it was loaded, so `create` made `livecheck` and `load` could not find
+  it. `create` now also refuses a name that only *sounds* like an existing one.
+- **`load` speaks only when there is a wait**, and moves the client last —
+  a failed load leaves it where it was rather than in a workspace it cannot
+  talk to.
+- **A denied `delete` returns no sentence at all.** The supervisor has already
+  said what it did; a second "left it alone" is worse than one.
+- **Workspace errors still ride the `internal` wire code.** The sentence is
+  what carries the difference and the client plays one earcon regardless;
+  phase 4's protocol bump is where they get codes of their own.
+- **One extra router call on a malformed answer.** See below.
+- No new config, no new dependencies.
+
+**What the eval found, which is what it is for:** the schema going from two
+fields to three made `deepseek/deepseek-v4-flash` return prose instead of JSON
+in ~3% of calls — the same strict-mode failure AGENTS.md already records for
+the `-latest` alias, now reproducing on the dated model. It scored 70/73 with
+two such errors. `Router.route` now asks exactly once more when an answer is
+unusable (malformed only — not transport failures, not non-2xx), which took it
+to **73/73 with no critical misroutes**. `google/gemini-2.5-flash-lite` scored
+72/73 and is five times faster, but still misroutes "make it new" to
+`new_session` — the same critical failure that chose the current default, so
+the default stands.
+
+**Verified:** 177/177 tests (23 new), clean typecheck, and 21 live checks
+driving the real server over a real socket — utterances synthesized with
+Kokoro, sent as ordinary audio frames through real Groq STT, the real routing
+model, real Podman, with the *replies transcribed back* so the assertions are
+on what the user would hear. Create, list, load, an unknown name, a denied
+delete, and an approved delete, all by voice. The retry fired twice during
+those six turns and recovered both.
 
 ---
 
@@ -431,10 +485,12 @@ the config module, the README table, and `.env.example` together.
 
 ## Risks worth naming
 
-- **Router argument extraction is the highest-variance piece.** It is the only
-  change that makes a model's output structurally harder, and the repo already
-  has a recorded instance of a model quietly failing strict schema mode. The
-  eval is the control; run it before trusting the phase.
+- ~~**Router argument extraction is the highest-variance piece.**~~ Retired,
+  and it was the right thing to have named: the wider schema did degrade strict
+  JSON mode, in exactly the recorded way, at a rate high enough to lose turns.
+  The eval caught it, a single retry on a malformed answer fixed it, and the
+  extraction itself was never the problem — 13/13 workspace cases and 10/10
+  workspace-adversarial on the first run.
 - ~~**The Podman socket work is the likeliest schedule surprise.**~~ Retired in
   full. `list` landed in phase 1 in about half an hour; `create` with mounts,
   labels and a published port landed in phase 2 and was not where the trouble

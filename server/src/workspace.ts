@@ -59,7 +59,19 @@ export interface PermissionOwner {
   handlePermission(request: PermissionRequest, context: PermissionContext): void;
 }
 
-export class WorkspaceUnknownError extends Error {}
+/**
+ * A name that resolves to nothing. Carries the name, because the spoken form of
+ * this is "I don't know a workspace called X" — saying which one failed is the
+ * whole difference between a useful error and a shrug.
+ */
+export class WorkspaceUnknownError extends Error {
+  readonly workspace: string;
+
+  constructor(name: string) {
+    super(`no workspace called ${name}`);
+    this.workspace = name;
+  }
+}
 
 export class Workspace {
   readonly name: string;
@@ -212,12 +224,10 @@ export class WorkspaceRegistry {
     return this.byName.get(name);
   }
 
-  /** Resolve a name, or fail in the way phase 3 speaks aloud. */
+  /** Resolve a name, or fail in the way `spokenWorkspaceError` reads out. */
   require(name: string): Workspace {
     const workspace = this.byName.get(name);
-    if (!workspace) {
-      throw new WorkspaceUnknownError(`no workspace called ${name}`);
-    }
+    if (!workspace) throw new WorkspaceUnknownError(name);
     return workspace;
   }
 
@@ -344,8 +354,9 @@ export class WorkspaceSession implements SessionController {
  * in each one it has visited.
  *
  * Sessions are created lazily and kept after leaving a workspace, so going back
- * resumes rather than restarts. Nothing here changes the active workspace yet —
- * phase 3's `load` is what gives the user a way to say so.
+ * resumes rather than restarts. `load` is the only thing that moves a client,
+ * and it moves exactly one — the active workspace is per connection, so a
+ * second client is never dragged along by the first.
  */
 export class ClientWorkspaces {
   private readonly registry: WorkspaceRegistry;
@@ -370,14 +381,48 @@ export class ClientWorkspaces {
   }
 
   get active(): Workspace {
+    const workspace = this.registry.get(this.activeName);
+    if (workspace) return workspace;
+    // The client's workspace was deleted underneath it — by this client in an
+    // earlier turn, or by another one. Falling back to the default is the only
+    // answer that leaves the client able to speak at all; the alternative is a
+    // connection whose every utterance fails on a name that will never resolve
+    // again. The user finds out because the next reply comes from somewhere
+    // else, which is what `list` and the `load` confirmation are for.
+    log.warn("active workspace is gone, falling back to the default", {
+      workspace: this.activeName,
+      fallback: this.registry.defaultName,
+    });
+    this.activeName = this.registry.defaultName;
     return this.registry.require(this.activeName);
+  }
+
+  /** The name of the workspace this client is in. Spoken by `list`. */
+  get activeWorkspaceName(): string {
+    return this.activeName;
+  }
+
+  /**
+   * Move this client into another workspace. What `load` does last.
+   *
+   * Per-client, deliberately: a second client sharing the daemon must not be
+   * moved by this one saying "load space game". The registry lookup is what
+   * makes an unknown name fail here rather than on the next utterance.
+   */
+  setActive(name: string): void {
+    this.registry.require(name);
+    this.activeName = name;
   }
 
   /** The client's conversation in its active workspace, created on demand. */
   session(): WorkspaceSession {
     const workspace = this.active;
     const existing = this.sessions.get(workspace.name);
-    if (existing) return existing;
+    // Same name, different workspace: deleted and recreated. The old session id
+    // belongs to an OpenCode that no longer exists, so resuming it would prompt
+    // into nothing.
+    if (existing && existing.workspace === workspace) return existing;
+    if (existing) existing.release();
 
     if (!this.owner) {
       throw new Error("client workspaces used before an owner was attached");

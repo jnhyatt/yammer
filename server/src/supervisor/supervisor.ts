@@ -212,6 +212,94 @@ export class PermissionSupervisor {
     }
   }
 
+  /**
+   * Ask the user to approve something **Yammer** is about to do, rather than
+   * something a container asked for.
+   *
+   * Workspace `delete` is the case that exists today: it is triggered by a
+   * routing model's reading of an imperfect transcript, it destroys a working
+   * directory, and it happens outside any container — so it is exactly the
+   * "operations Yammer performs on the user's behalf outside the sandbox" the
+   * requirements doc routes through this gate.
+   *
+   * It shares the answer window, the keyword matcher and the second voice with
+   * `handle`, and differs in what it can offer: there is no OpenCode request to
+   * reply to, and no pattern for "always" to widen to, so a heard "always" is
+   * taken as this-one-time and nothing is remembered. Silence denies.
+   *
+   * Phase 5 is where this and `handle` become one source-agnostic path; keeping
+   * them separate for now avoids reshaping the OpenCode side to land a gate the
+   * requirements doc already asks for.
+   */
+  async confirm(
+    turn: number,
+    id: string,
+    question: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    log.info("supervising a yammer action", { id, turn });
+    try {
+      for (let attempt = 0; attempt < this.config.maxAttempts; attempt += 1) {
+        if (signal.aborted) return this.resolveConfirm(turn, id, "reject", false);
+
+        const asked =
+          attempt === 0
+            ? question
+            : repromptQuestion(this.lastMiss === "silence" ? "silence" : "unrecognized");
+
+        this.sink.send({ t: "permission.ask", turn, id, question: asked, attempt });
+        await this.speak(turn, asked, signal);
+        if (signal.aborted) return this.resolveConfirm(turn, id, "reject", false);
+
+        const match = await this.classify(await this.collectAnswer(turn, id));
+        this.lastMiss = match.kind === "silence" ? "silence" : "unrecognized";
+
+        // "always" has nothing to widen to here, so it is just a loud yes.
+        if (match.kind === "approve" || match.kind === "always") {
+          return this.resolveConfirm(turn, id, "once", true);
+        }
+        if (match.kind === "deny") return this.resolveConfirm(turn, id, "reject", true);
+
+        log.info("answer not recognized", { id, attempt, kind: match.kind });
+      }
+      return this.resolveConfirm(turn, id, "timeout", true);
+    } catch (cause) {
+      log.error("supervisor failed", { id, error: String(cause) });
+      this.sink.send({
+        t: "error",
+        turn,
+        code: "supervisor_failed",
+        message: "The approval prompt failed, so I didn't do it.",
+      });
+      // Anything unexplained is a no. Nothing is blocked waiting on this — the
+      // caller is Yammer itself — so the only thing to get right is the answer.
+      return this.resolveConfirm(turn, id, "reject", false);
+    }
+  }
+
+  /**
+   * Close the client's answer window and say what was decided.
+   *
+   * The sentence is awaited rather than fired off, because the caller speaks
+   * again the moment this returns: two synthesis loops running at once would
+   * interleave their segments, and both number theirs from zero.
+   */
+  private async resolveConfirm(
+    turn: number,
+    id: string,
+    response: PermissionResponse,
+    speakOutcome: boolean,
+  ): Promise<boolean> {
+    this.sink.send({ t: "permission.resolved", turn, id, response });
+    if (speakOutcome) {
+      const sentence = response === "once" ? "Okay, doing it." : "Okay, leaving it alone.";
+      await this.speak(turn, sentence).catch((cause) => {
+        log.warn("could not speak the outcome", { error: String(cause) });
+      });
+    }
+    return response === "once";
+  }
+
   private async classify(audio: Buffer | null) {
     if (audio === null || audio.length === 0) return { kind: "silence" } as const;
 

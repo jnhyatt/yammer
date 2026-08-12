@@ -14,7 +14,13 @@ import { log } from "./log.ts";
 import { OpenCodeError } from "./opencode/client.ts";
 import type { PermissionRequest } from "./opencode/permissions.ts";
 import { SPEECH_FORMAT, type ErrorCode, type ServerMessage, type TurnOutcome } from "./protocol.ts";
-import { findCommand } from "./router/commands.ts";
+import {
+  findCommand,
+  spokenWorkspaceError,
+  type CommandContext,
+  type WorkspaceDirectory,
+  type WorkspaceLifecycle,
+} from "./router/commands.ts";
 import { RouterError, type Router } from "./router/router.ts";
 import { SttClient, SttError } from "./stt/groq.ts";
 import type { PermissionContext, PermissionSupervisor } from "./supervisor/supervisor.ts";
@@ -47,11 +53,18 @@ interface ActiveTurn {
 /** Guard against a stuck client streaming forever. 60s at 16 kHz mono s16le. */
 const MAX_UTTERANCE_BYTES = 60 * 16_000 * 2;
 
+/** What a turn needs beyond its own client to run a workspace meta-command. */
+export interface TurnWorkspaces {
+  registry: WorkspaceDirectory;
+  manager: WorkspaceLifecycle;
+}
+
 export class TurnManager {
   private readonly sink: TurnSink;
   private readonly stt: SttClient;
   private readonly router: Router;
   private readonly client: ClientWorkspaces;
+  private readonly workspaces: TurnWorkspaces;
   private readonly tts: TtsEngine;
   private readonly supervisor: PermissionSupervisor;
 
@@ -63,6 +76,7 @@ export class TurnManager {
     stt: SttClient,
     router: Router,
     client: ClientWorkspaces,
+    workspaces: TurnWorkspaces,
     tts: TtsEngine,
     supervisor: PermissionSupervisor,
   ) {
@@ -70,6 +84,7 @@ export class TurnManager {
     this.stt = stt;
     this.router = router;
     this.client = client;
+    this.workspaces = workspaces;
     this.tts = tts;
     this.supervisor = supervisor;
   }
@@ -221,6 +236,7 @@ export class TurnManager {
     this.sink.send({ t: "transcript", turn: id, text: transcript });
 
     let action: string;
+    let argument: string;
     try {
       this.sink.send({ t: "turn.status", turn: id, state: "routing" });
       const decision = await this.router.route(
@@ -229,6 +245,7 @@ export class TurnManager {
         signal,
       );
       action = decision.action;
+      argument = decision.workspace;
     } catch (cause) {
       return this.fail(id, "router_failed", "The router failed, so I didn't act on that.", cause);
     }
@@ -262,17 +279,48 @@ export class TurnManager {
         return this.fail(id, "internal", "I didn't understand that command.", action);
       }
       try {
-        spoken = await command.run(session);
+        spoken = await command.run(this.commandContext(id, session, argument, signal));
         outcome = "meta_command";
       } catch (cause) {
-        console.log(cause);
+        // A workspace command's failures have their own sentences — the
+        // requirements doc asks for one per failure point, and they are the
+        // only thing the user gets to diagnose from.
+        // One wire code for all of them for now: the client plays the same
+        // earcon whatever it says, and the sentence carries the difference.
+        // Phase 4's protocol bump is where they get codes of their own.
+        const workspaceError = spokenWorkspaceError(cause);
+        if (workspaceError) return this.fail(id, "internal", workspaceError, cause);
         return this.fail(id, opencodeCode(cause), spokenOpencodeError(cause), cause);
       }
     }
     if (signal.aborted) return;
 
-    await this.speak(id, spoken, signal);
+    // A command may have said everything it had to say already — the denied
+    // delete, whose refusal the supervisor has just spoken.
+    if (spoken.trim() !== "") await this.speak(id, spoken, signal);
     this.finish(id, outcome);
+  }
+
+  /**
+   * What a meta-command is handed. Built per turn, not per connection, because
+   * `say` and `confirm` are tied to the turn tag the client is waiting on.
+   */
+  private commandContext(
+    turn: number,
+    session: WorkspaceSession,
+    argument: string,
+    signal: AbortSignal,
+  ): CommandContext {
+    return {
+      session,
+      registry: this.workspaces.registry,
+      manager: this.workspaces.manager,
+      client: this.client,
+      argument,
+      say: (text) => this.speak(turn, text, signal),
+      confirm: (question) =>
+        this.supervisor.confirm(turn, `yammer-${turn}`, question, signal),
+    };
   }
 
   /** Synthesize and stream, one WebSocket segment per sentence. */

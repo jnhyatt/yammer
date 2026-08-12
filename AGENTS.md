@@ -90,8 +90,8 @@ Config comes from the environment, with a `.env` loaded at startup — first fil
 found wins, files are never merged, and the real environment always beats the
 file. Both READMEs document the search order.
 
-`npm test` (server) runs seven suites. What they have in common is that all
-seven guard failures that are **silent** — everything else here fails loudly,
+`npm test` (server) runs eight suites. What they have in common is that all
+eight guard failures that are **silent** — everything else here fails loudly,
 since a bad model id 404s and a protocol mismatch closes the socket.
 
 - `supervisor/keywords.test.ts` — the approve/deny matcher. A mistranscription
@@ -117,6 +117,11 @@ since a bad model id 404s and a protocol mismatch closes the socket.
   invisible until someone is standing there being told the wrong thing.
 - `opencode/client.test.ts` — one test, for one hang observed against a real
   container. See the readiness-probe gotcha below.
+- `router/commands.test.ts` — the workspace commands' spoken half. Two failure
+  kinds reading out identically, a `load` that creates on a mishearing, and a
+  `delete` that runs without a spoken yes are all invisible to a typechecker
+  and expensive in exactly one place: out loud, to someone who can't see a
+  screen.
 
 **One thing is still worth promoting into a checked-in test**: the `.env` parser
 parity check. `client/.../env.py` hand-implements Node's `process.loadEnvFile`
@@ -142,8 +147,10 @@ them should produce no diff unless something genuinely changed — see
 `npm run eval:router` (`server/src/router/eval/`) is a different kind of check
 — not correctness, but a live quality/regression eval for whichever model
 `YAMMER_ROUTER_MODEL` points at, run by hand when changing it. Needs
-`YAMMER_ROUTER_API_KEY`; nothing else. Not yet run against live models — see
-gotchas.
+`YAMMER_ROUTER_API_KEY`; nothing else. It is also the control on the router's
+*schema*: adding a slot changes what the model has to produce, so it gets
+re-run when `META_COMMANDS` grows, not only when the model does. Current
+standing: 73/73 for the default model, no critical misroutes.
 
 ## Conventions
 
@@ -232,6 +239,24 @@ Notes here should be things that cost someone time.
   had neither problem. Re-run the eval before trusting a new model here; one
   case flipping a 98% score into a critical failure is why category-average
   accuracy alone is not the metric that matters.
+- **Whisper decides for itself whether a two-word name is one word.** In one
+  live sitting, "live check" came back as `LiveCheck` when the workspace was
+  created and as `live check` when it was loaded — so the workspace was made as
+  `livecheck` and then not found. Workspace names are therefore resolved on a
+  key with *all* separators stripped (`lifecycle.ts`'s `workspaceMatchKey`),
+  not on the hyphenated sanitized name, and `create` refuses a name that only
+  sounds like an existing one. Anything else that matches a spoken name against
+  stored state needs the same treatment; the sanitized form is for Podman, not
+  for lookups.
+- **`response_format: json_schema` strict mode is a hint, not a guarantee, and
+  it gets flakier as the schema grows.** `deepseek/deepseek-v4-flash` was clean
+  over 50 cases with a two-field schema; adding the `workspace` slot made it
+  return its three fields as YAML-ish prose in ~3% of calls, and the observed
+  rate on real turns was higher still. `Router.route` therefore asks exactly
+  once more when the answer is unusable — malformed only, never a transport
+  error or a non-2xx — which took a 70/73 eval to 73/73. Don't "simplify" it
+  into a general retry: retrying a down provider just doubles the latency
+  before the same failure.
 - **OpenCode does not hot-reload agent files, and the SDK's `session.prompt()`
   is not `POST /session/{id}/prompt`.** Two things that will each waste an hour
   when touching the agent. Config-time files — `.opencode/agent/*.md`,

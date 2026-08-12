@@ -309,6 +309,40 @@ Ports are published on `127.0.0.1` only, with the host port chosen by the OS at
 create time and recorded in the registry. Containers never need to reach each
 other, so there is no shared network.
 
+## Workspaces by voice
+
+Four spoken commands, handled by Yammer itself and never forwarded to OpenCode:
+
+| Say | What happens |
+| --- | --- |
+| "create a workspace called space game" | container and directory, left **stopped** |
+| "load space game" | starts it if stopped, waits for OpenCode, moves *this client* into it |
+| "what workspaces do I have" | each name, its state, and which one you are in |
+| "delete the space game workspace" | spoken approve/deny prompt, then the container, directory and record |
+
+Three things about these are deliberate and worth knowing before changing them.
+
+**`load` does not create.** A name Yammer does not know is a spoken error. The
+name arrives as a routing model's reading of a Whisper transcript, so a name
+that fails to resolve is at least as likely to be a mishearing as an intention,
+and create-on-miss turns every mishearing into a junk container.
+
+**Names are matched with separators removed.** Whisper decides on its own
+whether a two-word name is one word — the same utterance came back as
+"LiveCheck" and as "live check" in one sitting — so `space-game`, `space game`
+and `SpaceGame` are one workspace. `create` refuses a name that only *sounds*
+like an existing one, because two workspaces nobody can tell apart by voice are
+two workspaces nobody can use.
+
+**`delete` goes through the supervisor**, in its second voice, and silence is a
+no. It is the most destructive thing in the system and it is triggered by the
+least reliable input in it.
+
+Each failure has its own sentence — `src/router/commands.ts`'s
+`spokenWorkspaceError` is the whole list, one per `LifecycleFailure`. That is
+the point of the kinds existing: "OpenCode inside it never answered" and "it
+doesn't know the agent" mean different things to go and do.
+
 ## Shape
 
 ```
@@ -364,6 +398,10 @@ it guards a **silent** failure. Most of this repo fails loudly — a bad model i
 - `opencode/client.test.ts` — one test, for one observed hang: a rootless
   published port accepts connections before OpenCode is listening behind it, and
   an unbounded probe waits there forever with nothing in the log.
+- `router/commands.test.ts` — the spoken half of the workspace commands: that
+  every failure kind reads out differently, that `load` never creates, and that
+  a denied `delete` deletes nothing. All three are silent in the only way that
+  counts here — they typecheck, log nothing, and are wrong out loud.
 
 ## Evaluating router models
 
@@ -375,11 +413,17 @@ npm run eval:router -- <model-id> [<model-id> ...]     # any OpenRouter-compatib
 Scores model(s) against `src/router/eval/cases.ts` by driving the real `Router`
 class. Reports accuracy by category, latency, and — separately — any
 **critical misroutes**: a `forward` case in the adversarial set (e.g. "start a
-new file for the session handler") routed to `new_session` instead. Those are
-the failure that matters; a wrong `report_usage` just answers a question that
-wasn't asked, but a wrong `new_session` silently discards the conversation with
-no undo. When two or more models run, disagreements between them are listed
-separately at the end.
+new file for the session handler") routed to a destructive command instead.
+Those are the failure that matters; a wrong `report_usage` just answers a
+question that wasn't asked, but a wrong `new_session` silently discards the
+conversation and a wrong `delete_workspace` destroys a working directory. When
+two or more models run, disagreements between them are listed separately at the
+end.
+
+Workspace cases are scored on the **extracted name** as well as the action,
+compared after the same normalisation the server applies — so a model that
+answers "Space Game" for `space-game` is right, and one that answers "parser
+project" for `parser` is a miss reported in its own section.
 
 Needs only `YAMMER_ROUTER_API_KEY` (`.env` or exported) — nothing else the
 server needs. Add cases to `cases.ts` whenever `META_COMMANDS` grows; that's the
@@ -394,3 +438,9 @@ lives beside the description, so there is no second place to update.
 Write the `description` to say *when it applies and when it doesn't* — the
 router's failure mode is misrouting an ordinary coding instruction ("start a new
 file") into a meta-command, so the boundaries matter more than the summary.
+
+Set `takesWorkspace: true` if it needs a name, and read it from
+`context.argument` — the router fills that slot only for commands that declare
+it, so a name the model volunteers on a `forward` can never be read as an
+argument. `context.say` speaks before the command finishes (for anything with a
+wait in it) and `context.confirm` is the spoken approve/deny gate.

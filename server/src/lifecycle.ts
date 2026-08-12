@@ -58,17 +58,20 @@ const POLL_INTERVAL_MS = 250;
  * `agent-missing` means the mount is wrong, `not-ready` means look at the
  * container's logs.
  */
-export type LifecycleFailure =
-  | "bad-name"
-  | "name-taken"
-  | "image-missing"
-  | "agent-file-missing"
-  | "container-gone"
-  | "start-failed"
-  | "port-drift"
-  | "not-ready"
-  | "agent-missing"
-  | "not-deletable";
+export const LIFECYCLE_FAILURES = [
+  "bad-name",
+  "name-taken",
+  "image-missing",
+  "agent-file-missing",
+  "container-gone",
+  "start-failed",
+  "port-drift",
+  "not-ready",
+  "agent-missing",
+  "not-deletable",
+] as const;
+
+export type LifecycleFailure = (typeof LIFECYCLE_FAILURES)[number];
 
 export class WorkspaceLifecycleError extends Error {
   readonly kind: LifecycleFailure;
@@ -95,6 +98,25 @@ export function sanitizeWorkspaceName(spoken: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
+}
+
+/**
+ * The key two spoken names have to share to mean one workspace.
+ *
+ * Separators are dropped entirely, which is stronger than `sanitizeWorkspaceName`
+ * and is the difference between a name that can be created and a name that can
+ * be said again afterwards. Whisper decides on its own whether a two-word name
+ * is two words: the same utterance came back as "LiveCheck" once and "live
+ * check" the next time, which sanitize alone turns into `livecheck` and
+ * `live-check` — two workspaces, one of which holds the user's work and neither
+ * of which they can reliably address.
+ *
+ * So this is what resolution matches on, and what `create` refuses a collision
+ * against: two workspaces that sound identical could never be told apart by
+ * voice, which is the only way anyone talks to Yammer.
+ */
+export function workspaceMatchKey(spoken: string): string {
+  return spoken.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 export interface WorkspaceManagerOptions {
@@ -138,8 +160,16 @@ export class WorkspaceManager {
         `"${spokenName}" has no usable characters for a workspace name`,
       );
     }
-    if (this.registry.get(name)) {
-      throw new WorkspaceLifecycleError("name-taken", name, `a workspace called ${name} already exists`);
+    // By match key, not by name: `live-check` and `livecheck` are one workspace
+    // as far as anyone speaking to Yammer is concerned.
+    const key = workspaceMatchKey(name);
+    const clash = this.registry.list().find((workspace) => workspaceMatchKey(workspace.name) === key);
+    if (clash) {
+      throw new WorkspaceLifecycleError(
+        "name-taken",
+        clash.name,
+        `a workspace called ${clash.name} already exists`,
+      );
     }
     await this.requireAgentFile(name);
 

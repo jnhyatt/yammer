@@ -22,6 +22,7 @@ import {
   encodeServerMessage,
   type ServerMessage,
 } from "./protocol.ts";
+import type { WorkspaceLifecycle } from "./router/commands.ts";
 import { Router } from "./router/router.ts";
 import { SttClient } from "./stt/groq.ts";
 import { PermissionSupervisor } from "./supervisor/supervisor.ts";
@@ -39,6 +40,8 @@ export interface Deps {
   router: Router;
   /** Every project Yammer can work on. Each carries its own OpenCode. */
   workspaces: WorkspaceRegistry;
+  /** The lifecycle verbs, for the workspace meta-commands. */
+  manager: WorkspaceLifecycle;
   tts: TtsEngine;
 }
 
@@ -103,7 +106,15 @@ function handleConnection(
   // on a stream that carries both.
   const client = new ClientWorkspaces(deps.workspaces);
 
-  const turns = new TurnManager(sink, deps.stt, deps.router, client, deps.tts, supervisor);
+  const turns = new TurnManager(
+    sink,
+    deps.stt,
+    deps.router,
+    client,
+    { registry: deps.workspaces, manager: deps.manager },
+    deps.tts,
+    supervisor,
+  );
   client.attach(turns);
 
   const handshakeTimer = setTimeout(() => {

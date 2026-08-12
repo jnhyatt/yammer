@@ -207,6 +207,18 @@ describe("create", () => {
     );
   });
 
+  test("refuses a name that only sounds the same", async () => {
+    // `spacegame` and `space-game` are different container names and the same
+    // spoken one. Allowing both makes one of them permanently unreachable by
+    // voice, which is the only way anyone reaches a workspace at all.
+    const h = await harness();
+    await h.manager.create("space-game");
+    await assert.rejects(
+      () => h.manager.create("SpaceGame"),
+      (error: WorkspaceLifecycleError) => error.kind === "name-taken",
+    );
+  });
+
   test("refuses a name with nothing usable in it", async () => {
     const h = await harness();
     await assert.rejects(

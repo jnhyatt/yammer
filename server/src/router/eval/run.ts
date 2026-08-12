@@ -17,6 +17,7 @@
  */
 
 import { loadEnvFile } from "../../env.ts";
+import { sanitizeWorkspaceName } from "../../lifecycle.ts";
 import { Router, RouterError, type SessionState } from "../router.ts";
 import { EVAL_CASES, type EvalCase, type ExpectedAction } from "./cases.ts";
 
@@ -41,8 +42,30 @@ const CONCURRENCY = 5;
 interface CaseResult {
   case: EvalCase;
   actual: ExpectedAction | "error";
+  /** The name the router extracted, verbatim. */
+  workspace: string;
   ms: number;
   error?: string;
+}
+
+/**
+ * Right action, right name.
+ *
+ * Names are compared after the server's own normalisation, because that is the
+ * comparison the server makes: "Space Game", "space game" and "space-game" are
+ * one workspace, and a model that returns any of them is right.
+ */
+function passed(result: CaseResult): boolean {
+  if (result.actual !== result.case.expected) return false;
+  if (result.case.workspace === undefined) return true;
+  return (
+    sanitizeWorkspaceName(result.workspace) === sanitizeWorkspaceName(result.case.workspace)
+  );
+}
+
+/** A pass on the action but a miss on the argument — worth reporting apart. */
+function wrongNameOnly(result: CaseResult): boolean {
+  return result.actual === result.case.expected && !passed(result);
 }
 
 async function main(): Promise<void> {
@@ -92,11 +115,17 @@ async function runCases(router: Router): Promise<CaseResult[]> {
       const started = Date.now();
       try {
         const decision = await router.route(evalCase.transcript, SESSION_STATE);
-        results[i] = { case: evalCase, actual: decision.action as ExpectedAction, ms: Date.now() - started };
+        results[i] = {
+          case: evalCase,
+          actual: decision.action as ExpectedAction,
+          workspace: decision.workspace,
+          ms: Date.now() - started,
+        };
       } catch (cause) {
         results[i] = {
           case: evalCase,
           actual: "error",
+          workspace: "",
           ms: Date.now() - started,
           error: cause instanceof RouterError ? cause.message : String(cause),
         };
@@ -108,23 +137,40 @@ async function runCases(router: Router): Promise<CaseResult[]> {
   return results;
 }
 
+/**
+ * Actions that destroy something the user cannot get back. Landing on one of
+ * these when the case expected something else is the failure class the whole
+ * eval exists to catch — `new_session` throws away a conversation,
+ * `delete_workspace` throws away a working directory.
+ */
+const DESTRUCTIVE: readonly string[] = ["new_session", "delete_workspace"];
+
 function report(model: string, results: CaseResult[]): void {
-  const correct = results.filter((r) => r.actual === r.case.expected);
-  const wrong = results.filter((r) => r.actual !== r.case.expected);
+  const correct = results.filter(passed);
+  const wrong = results.filter((r) => !passed(r));
   // A miss is critical if the case was pre-flagged as an adversarial
   // near-miss for a destructive command, OR — regardless of how the case was
-  // categorized — if the router actually landed on `new_session`. The second
-  // clause catches cases like "make it new" that weren't anticipated as
+  // categorized — if the router actually landed on a destructive action. The
+  // second clause catches cases like "make it new" that weren't anticipated as
   // adversarial for this command but produced the destructive outcome anyway;
   // the consequence, not the input's category, is what makes a miss critical.
-  const critical = wrong.filter((r) => r.case.critical || r.actual === "new_session");
+  // An errored call is not critical however the case was flagged: the turn
+  // fails, the user is told so, and nothing is destroyed. Counting it here
+  // buries the misroutes this line exists to surface — errors have their own
+  // section below.
+  const critical = wrong.filter(
+    (r) =>
+      r.actual !== "error" &&
+      (r.case.critical || (DESTRUCTIVE.includes(r.actual) && r.actual !== r.case.expected)),
+  );
   const errored = results.filter((r) => r.actual === "error");
+  const namesOnly = results.filter(wrongNameOnly);
 
   const byCategory = new Map<string, { correct: number; total: number }>();
   for (const r of results) {
     const bucket = byCategory.get(r.case.category) ?? { correct: 0, total: 0 };
     bucket.total += 1;
-    if (r.actual === r.case.expected) bucket.correct += 1;
+    if (passed(r)) bucket.correct += 1;
     byCategory.set(r.case.category, bucket);
   }
 
@@ -152,7 +198,16 @@ function report(model: string, results: CaseResult[]): void {
     console.log("\nno critical misroutes");
   }
 
-  const nonCriticalWrong = wrong.filter((r) => !r.case.critical);
+  if (namesOnly.length > 0) {
+    console.log(`\n${namesOnly.length} right action, wrong workspace name:`);
+    for (const r of namesOnly) {
+      console.log(
+        `  "${r.case.transcript}" -> expected "${r.case.workspace}", got "${r.workspace}"`,
+      );
+    }
+  }
+
+  const nonCriticalWrong = wrong.filter((r) => !r.case.critical && !wrongNameOnly(r));
   if (nonCriticalWrong.length > 0) {
     console.log(`\n${nonCriticalWrong.length} other miss(es):`);
     for (const r of nonCriticalWrong) {

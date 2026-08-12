@@ -10,18 +10,46 @@
  * outnumber the straightforward positives.
  *
  * `critical: true` marks cases where a misroute is destructive
- * (`new_session` loses history) rather than merely wrong (`report_usage`
- * misfiring just gets read back an answer to a question that wasn't asked).
- * The eval report calls these out separately from the raw accuracy number.
+ * (`new_session` loses history, `delete_workspace` destroys a project's whole
+ * working directory) rather than merely wrong (`report_usage` misfiring just
+ * gets read back an answer to a question that wasn't asked). The eval report
+ * calls these out separately from the raw accuracy number.
+ *
+ * The workspace commands add a second thing to get wrong: the **argument**. A
+ * case with an `workspace` is checked on the extracted name as well as the
+ * action, compared after the same normalisation the server applies — so
+ * "Space Game" and "space game" both count as `space-game`, which is exactly
+ * the claim that normalisation is what makes spoken names usable at all.
  */
 
-export type ExpectedAction = "forward" | "report_usage" | "compact_session" | "new_session";
+export type ExpectedAction =
+  | "forward"
+  | "report_usage"
+  | "compact_session"
+  | "new_session"
+  | "create_workspace"
+  | "load_workspace"
+  | "list_workspaces"
+  | "delete_workspace";
 
 export interface EvalCase {
   transcript: string;
   expected: ExpectedAction;
+  /**
+   * The workspace name the router should extract, before normalisation.
+   * Undefined means "not checked"; `""` means it must extract none — which is
+   * the right answer for an utterance that names no workspace, and the guard
+   * against a model helpfully inventing one.
+   */
+  workspace?: string;
   /** Groups cases in the report; not fed to the router. */
-  category: "meta-positive" | "adversarial" | "forward-generic" | "forward-ambiguous";
+  category:
+    | "meta-positive"
+    | "adversarial"
+    | "forward-generic"
+    | "forward-ambiguous"
+    | "workspace"
+    | "workspace-adversarial";
   /** A misroute here is destructive, not just wrong. */
   critical?: boolean;
 }
@@ -148,4 +176,133 @@ export const EVAL_CASES: readonly EvalCase[] = [
   { transcript: "yeah that looks right, next let's handle errors", expected: "forward", category: "forward-ambiguous" },
   { transcript: "make it new", expected: "forward", category: "forward-ambiguous" },
   { transcript: "clear it", expected: "forward", category: "forward-ambiguous" },
+
+  // --- workspace commands: positives, with the name to extract -------------
+  {
+    transcript: "create a workspace called space game",
+    expected: "create_workspace",
+    workspace: "space game",
+    category: "workspace",
+  },
+  {
+    transcript: "make me a new workspace named parser",
+    expected: "create_workspace",
+    workspace: "parser",
+    category: "workspace",
+  },
+  {
+    transcript: "set up a new workspace for the android client",
+    expected: "create_workspace",
+    workspace: "android client",
+    category: "workspace",
+  },
+  {
+    transcript: "load space game",
+    expected: "load_workspace",
+    workspace: "space game",
+    category: "workspace",
+  },
+  {
+    transcript: "switch to the yammer workspace",
+    expected: "load_workspace",
+    workspace: "yammer",
+    category: "workspace",
+  },
+  {
+    transcript: "let's work on the parser project now",
+    expected: "load_workspace",
+    workspace: "parser",
+    category: "workspace",
+  },
+  {
+    // Capitalisation and hyphenation are the STT layer's guess, not the user's
+    // intent — normalisation is what makes this the same workspace as "load
+    // space game" above.
+    transcript: "open up Space-Game please",
+    expected: "load_workspace",
+    workspace: "space game",
+    category: "workspace",
+  },
+  { transcript: "what workspaces do I have", expected: "list_workspaces", workspace: "", category: "workspace" },
+  { transcript: "list my workspaces", expected: "list_workspaces", workspace: "", category: "workspace" },
+  { transcript: "which workspace am I in", expected: "list_workspaces", workspace: "", category: "workspace" },
+  {
+    transcript: "delete the space game workspace",
+    expected: "delete_workspace",
+    workspace: "space game",
+    category: "workspace",
+  },
+  {
+    transcript: "get rid of the old test workspace entirely",
+    expected: "delete_workspace",
+    workspace: "old test",
+    category: "workspace",
+  },
+  {
+    // Names nothing that could be a workspace name. Extracting one anyway is
+    // the failure this case exists for: the server would then delete whatever
+    // the model invented, and "this" is not a name it can be told apart from.
+    transcript: "delete this workspace",
+    expected: "delete_workspace",
+    workspace: "",
+    category: "workspace",
+  },
+
+  // --- workspace commands: adversarial ------------------------------------
+  // A workspace is a whole project. Everything here is about something inside
+  // one, phrased with the same verbs. The delete cases are critical for the
+  // obvious reason: a misroute destroys a working directory and its
+  // uncommitted work, and the supervisor prompt is the only thing between the
+  // transcript and that.
+  {
+    transcript: "delete the old test directory",
+    expected: "forward",
+    category: "workspace-adversarial",
+    critical: true,
+  },
+  {
+    transcript: "remove the unused imports from this file",
+    expected: "forward",
+    category: "workspace-adversarial",
+    critical: true,
+  },
+  {
+    transcript: "get rid of this whole function, it's dead code",
+    expected: "forward",
+    category: "workspace-adversarial",
+    critical: true,
+  },
+  {
+    transcript: "delete everything in the build directory",
+    expected: "forward",
+    category: "workspace-adversarial",
+    critical: true,
+  },
+  {
+    transcript: "make a new directory called space game",
+    expected: "forward",
+    category: "workspace-adversarial",
+    critical: true,
+  },
+  {
+    transcript: "create a new module for the parser",
+    expected: "forward",
+    category: "workspace-adversarial",
+  },
+  { transcript: "load the config file", expected: "forward", category: "workspace-adversarial" },
+  {
+    transcript: "switch to the other branch",
+    expected: "forward",
+    category: "workspace-adversarial",
+  },
+  {
+    transcript: "list the files in the source directory",
+    expected: "forward",
+    category: "workspace-adversarial",
+  },
+  {
+    transcript: "clone the space game repo into this directory",
+    expected: "forward",
+    category: "workspace-adversarial",
+  },
 ];

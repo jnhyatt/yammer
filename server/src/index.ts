@@ -34,6 +34,7 @@ async function main(): Promise<void> {
     stt: new SttClient(config.stt),
     router: new Router(config.router),
     workspaces,
+    manager,
     tts,
   };
 
