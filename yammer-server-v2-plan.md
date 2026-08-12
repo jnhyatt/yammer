@@ -8,8 +8,9 @@ supervising several per-project OpenCode containers.
 Read the requirements doc first. This file is *how* and *in what order*, not
 *what* or *why* — where the two disagree, the requirements doc wins.
 
-**Progress: phases 0 and 1 are done.** Each phase below carries its own status,
-including what was deviated from and why. Phases 2–5 are unstarted.
+**Progress: phases 0, 1 and 2 are done** — the load-bearing ones. Each phase
+below carries its own status, including what was deviated from and why. Phases
+3–5 are unstarted.
 
 ## Where v1 was
 
@@ -43,7 +44,7 @@ are additive.
 |---|---|---|---|
 | 0 | `Workspace` handle; one workspace, from today's config | — | **done** |
 | 1 | Registry, persistence, startup reconciliation | 0 | **done** |
-| 2 | Container lifecycle behind a runtime interface | 1 | not started |
+| 2 | Container lifecycle behind a runtime interface | 1 | **done** |
 | 3 | Workspace meta-commands + router argument extraction | 2 | not started |
 | 4 | Multi-client, per-client active workspace, protocol v3 | 3 | not started |
 | 5 | Supervisor generalization + permission policy rework | 3 | not started |
@@ -195,7 +196,7 @@ audio.
 
 ---
 
-## Phase 2 — container lifecycle
+## Phase 2 — container lifecycle ✅
 
 The first genuinely new subsystem. Everything here sits behind one interface so
 that the lifecycle state machine is testable without a container runtime.
@@ -269,22 +270,85 @@ Creating a workspace must not rebuild it. Decide the image refresh story
 explicitly — a stale pinned image is a better default than a workspace creation
 that takes four minutes.
 
+### What landed
+
+[`lifecycle.ts`](server/src/lifecycle.ts) holds the four verbs;
+[`container/runtime.ts`](server/src/container/runtime.ts) grew `create`,
+`start`, `stop`, `remove` and `inspect`;
+[`container/podman.ts`](server/src/container/podman.ts) implements them and
+[`container/fake.ts`](server/src/container/fake.ts) is the in-memory equivalent
+the tests run against. `WorkspaceLifecycleError` carries a `kind`, which is how
+each of `load`'s failure points keeps its own spoken error in phase 3 — the
+module itself says nothing aloud.
+
+**Image refresh, decided:** a pinned image, never built on demand. `create`
+against a missing image is an `image-missing` error naming the `podman build`
+command. Rebuilding inside `create` would make "make me a workspace" a
+four-minute wait on an Arch mirror, and a stale image is the better failure.
+
+Decisions worth knowing:
+
+- **Ports are allocated by asking for `host_port: 0`**, not by scanning. Podman
+  assigns it at *create* time, so `inspect` reads it back before the container
+  has run and the registry records it immediately. A port that later disagrees
+  with the record is `port-drift` and refuses to load, because the client's base
+  URL is already built and carrying on would mean prompting whatever else now
+  answers there.
+- **Credentials mount read-only inside the read-write per-workspace state
+  mount.** Podman orders nested mounts by depth, so this works; it is verified
+  live rather than assumed, in both directions (the state dir is writable, and
+  `auth.json` is not).
+- **`create` leaves the workspace stopped.** The doc's lifecycle has a
+  "created, stopped" state, and a create that also waited for readiness would
+  have two failure sets in one operation.
+- **`delete` will not remove a directory outside `YAMMER_WORKSPACE_ROOT`.**
+  `workDir` comes off a file a person can edit, and the function ends in a
+  recursive delete.
+- **Startup got a non-blocking status refresh**, after `listen` and deliberately
+  not awaited: reconciliation can only say a container is up, so without it a
+  workspace running for a week still reads `starting`.
+- New config: `YAMMER_OPENCODE_IMAGE`, `YAMMER_WORKSPACE_ROOT`,
+  `YAMMER_AGENT_FILE`, `YAMMER_OPENCODE_AUTH`,
+  `YAMMER_WORKSPACE_READY_SECONDS`, `YAMMER_WORKSPACE_STOP_SECONDS`. No new
+  dependencies.
+
+**One thing the plan got wrong**, found by running it rather than by reading it:
+a rootless published port is bound by Podman's port forwarder before OpenCode is
+listening behind it, so a probe during that window is *accepted and then never
+answered*. `fetch` has no default timeout, so the first live `load` hung
+indefinitely with nothing in the log after "waiting for OpenCode" — the
+readiness deadline never got a chance to fire, because the loop never got back
+to checking it. `probeAgent` now takes a bounded `AbortSignal.timeout`, and
+[`opencode/client.test.ts`](server/src/opencode/client.test.ts) reproduces the
+hang against a socket that accepts and stays silent.
+
+**Verified:** 154/154 tests (31 new), clean typecheck, and 28 live checks
+against real Podman 6.0.2 covering the whole cycle — create, the four mounts,
+readiness, stop, load again, a rejected duplicate name, delete, and `load` on a
+deleted workspace. A cold container answers in about 2s; `load` returns ready in
+about 7s, the difference being one bounded probe against that startup window.
+
 ---
 
 ## Phase 3 — meta-commands and router arguments
 
 - Broaden `MetaCommand.run`. Today it takes a `SessionController`
   ([`commands.ts`](server/src/router/commands.ts)); it needs a context carrying
-  the registry, the runtime, and the active workspace's session where one
-  applies.
-- Add `create`, `load`, `list`, `delete`. **`load` does not create** — an
+  the registry, the [`WorkspaceManager`](server/src/lifecycle.ts), and the
+  active workspace's session where one applies.
+- Add `create`, `load`, `list`, `delete`. The machinery exists — this phase is
+  the voice on top of it, which means mapping each `WorkspaceLifecycleError`
+  kind to its own spoken sentence, speaking during `starting` (~7s, measured),
+  and putting `delete` behind the supervisor. **`load` does not create** — an
   unknown name is a spoken error. This is the single most important behavioral
   detail in the phase: `load` reaches Yammer as a routing model's reading of a
   Whisper transcript, and create-on-miss turns every mishearing into a junk
   container.
 - Router schema gains a workspace-name slot. Name resolution is normalised
-  matching against the registry (case, spacing, hyphenation), and a miss is an
-  error rather than a nearest-neighbour guess.
+  matching against the registry (case, spacing, hyphenation) — phase 2's
+  `sanitizeWorkspaceName` is that normalisation and already lands "Space Game"
+  and "space game" on one workspace. A miss is an error rather than a
+  nearest-neighbour guess.
 - **Re-run `npm run eval:router`.** Two independent reasons, either sufficient:
   the schema is changing from a closed enum to an enum plus free text, and
   AGENTS.md already records a model that did not reliably honour strict
@@ -371,15 +435,15 @@ the config module, the README table, and `.env.example` together.
   change that makes a model's output structurally harder, and the repo already
   has a recorded instance of a model quietly failing strict schema mode. The
   eval is the control; run it before trusting the phase.
-- ~~**The Podman socket work is the likeliest schedule surprise.**~~ Retired.
-  Pulled into phase 1, because reconciliation needs to list containers, and it
-  took about half an hour. What remains of the risk is that `list` is the
-  easiest libpod call; `create` with mounts, labels, and a published port is
-  where the under-documentation will actually bite.
-- **Container start latency is new user-facing latency.** The doc requires
-  spoken feedback during `starting`, which means the first `load` of a sitting
-  has a spoken "one sec" and then a real wait. Worth measuring early; if it is
-  long enough to feel broken, that is a requirements conversation, not something
-  to optimize quietly.
-- **Disk.** N containers plus N working copies, and `delete` has to actually
-  reclaim both the container and its directory.
+- ~~**The Podman socket work is the likeliest schedule surprise.**~~ Retired in
+  full. `list` landed in phase 1 in about half an hour; `create` with mounts,
+  labels and a published port landed in phase 2 and was not where the trouble
+  was. The trouble was on the *other* side of the socket — see phase 2's note on
+  the port that accepts before anything is listening.
+- **Container start latency is new user-facing latency.** Measured in phase 2:
+  a cold container answers in ~2s, and `load` returns ready in ~7s. That is
+  short enough that the spoken "one sec" covers it and long enough that it must
+  be spoken. Phase 3 is where that sentence gets said.
+- ~~**Disk.**~~ Largely retired. `delete` reclaims the container, the working
+  directory and the per-workspace OpenCode state, verified live. What remains is
+  ordinary: N working copies is N working copies, and nothing warns about it.

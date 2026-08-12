@@ -30,6 +30,15 @@ export class OpenCodeError extends Error {
   }
 }
 
+/**
+ * How long one readiness probe waits before calling it unreachable.
+ *
+ * Generous next to a healthy answer, which is tens of milliseconds. This is
+ * sized for "the port is accepting but nothing is behind it yet", not for a
+ * slow reply.
+ */
+const PROBE_TIMEOUT_MS = 5_000;
+
 interface ModelRef {
   providerID: string;
   modelID: string;
@@ -112,39 +121,78 @@ export class OpenCodeClient {
   }
 
   /**
-   * Warn at startup if OpenCode doesn't know the configured agent.
+   * Is this OpenCode up, and does it know our agent?
    *
-   * Worth a dedicated check because the failure is otherwise invisible until the
-   * first forwarded turn, and its likeliest cause is subtle: OpenCode reads
-   * agent files once at boot and never hot-reloads them, so a newly added
-   * `.opencode/agent/*.md` means nothing to an `opencode serve` that was already
-   * running. Never fatal — OpenCode being unreachable at startup is a per-turn
-   * error path, not a configuration error.
+   * One call answers both because there is nothing else to ask: OpenCode
+   * publishes no health endpoint — its `app` namespace is `log` and `agents`,
+   * nothing more — so readiness has to be a real request, and this is the one
+   * whose answer Yammer needs to be true anyway.
+   *
+   * The three outcomes are deliberately not two. `unreachable` is the container
+   * still coming up, and the caller should keep waiting. `agent-missing` is
+   * terminal, and waiting cannot fix it: OpenCode reads agent files once at boot
+   * and never hot-reloads, so an agent that was not mounted when this server
+   * started never will be. Collapsing them would turn a five-second setup error
+   * into a full readiness timeout, and then into an unshaped reply mid-turn.
+   *
+   * **The timeout is not optional.** A rootless published port is bound by
+   * Podman's port forwarder before anything inside the container is listening,
+   * so there is a window during startup where the connection is accepted and
+   * then nothing ever comes back. `fetch` has no default timeout, so an
+   * unbounded probe hangs there forever — and a readiness loop whose probe
+   * never returns never gets back to checking its own deadline. Observed
+   * against a real container, not theorised.
    */
-  async verifyAgent(): Promise<void> {
+  async probeAgent(
+    timeoutMs = PROBE_TIMEOUT_MS,
+  ): Promise<"ready" | "unreachable" | "agent-missing"> {
     let names: string[];
     try {
-      const agents = await this.call(() => this.client.app.agents());
+      const agents = await this.call(() =>
+        this.client.app.agents({ signal: AbortSignal.timeout(timeoutMs) }),
+      );
       names = (Array.isArray(agents) ? agents : [])
         .map((agent) => (agent as { name?: unknown }).name)
         .filter((name): name is string => typeof name === "string");
-    } catch (error) {
-      log.warn("could not verify OpenCode agent", {
-        agent: this.options.agent,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return;
+    } catch {
+      return "unreachable";
     }
-
-    if (names.includes(this.options.agent)) {
-      log.info("opencode agent available", { agent: this.options.agent });
-      return;
-    }
-    log.warn("configured OpenCode agent is unknown — replies will not be TTS-shaped", {
+    if (names.includes(this.options.agent)) return "ready";
+    log.debug("opencode does not know the configured agent", {
       agent: this.options.agent,
       available: names.join(",") || "(none)",
-      hint: "restart opencode serve if the agent file is new",
     });
+    return "agent-missing";
+  }
+
+  /**
+   * Warn at startup if OpenCode doesn't know the configured agent.
+   *
+   * The logging half of `probeAgent`, for the config-derived workspace — an
+   * `opencode serve` Yammer did not start and cannot restart, so the only thing
+   * to do about a missing agent is say so. Never fatal: OpenCode being
+   * unreachable at startup is a per-turn error path, not a configuration error.
+   *
+   * Container workspaces do not come through here. Their equivalent is
+   * `lifecycle.ts`'s readiness poll, which can act on the answer.
+   */
+  async verifyAgent(): Promise<void> {
+    switch (await this.probeAgent()) {
+      case "ready":
+        log.info("opencode agent available", { agent: this.options.agent });
+        return;
+      case "unreachable":
+        log.warn("could not verify OpenCode agent", {
+          agent: this.options.agent,
+          baseUrl: this.options.baseUrl,
+        });
+        return;
+      case "agent-missing":
+        log.warn("configured OpenCode agent is unknown — replies will not be TTS-shaped", {
+          agent: this.options.agent,
+          hint: "restart opencode serve if the agent file is new",
+        });
+    }
   }
 
   /** Start a conversation. The caller owns the returned id. */

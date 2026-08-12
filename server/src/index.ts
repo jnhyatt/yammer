@@ -17,7 +17,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   setLogLevel(config.logLevel);
 
-  const workspaces = await loadWorkspaces(config);
+  const { registry: workspaces, manager } = await loadWorkspaces(config);
 
   log.info("starting yammer server", {
     envFile: config.envFile ?? "(none)",
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
 
   // Only workspaces with an OpenCode actually answering. A watcher pointed at a
   // stopped container would spend the process's life reconnecting to a closed
-  // port; phase 2's `load` is what starts one and connects to it.
+  // port; `load` is what starts one and connects to it.
   for (const workspace of workspaces.list()) {
     if (workspace.status !== "ready") {
       log.info("workspace registered but not running", {
@@ -59,6 +59,16 @@ async function main(): Promise<void> {
   }
 
   const wss = startServer(config, deps);
+
+  // Deliberately not awaited, and after `listen`: reconciliation can only say a
+  // container is up, so a workspace that has been running for a week still
+  // reads as `starting` until something asks the OpenCode inside it. That is
+  // worth correcting and never worth delaying the server for.
+  void manager.refreshStatuses().catch((error) => {
+    log.warn("could not refresh workspace statuses", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
 
   const shutdown = (signal: string) => {
     log.info("shutting down", { signal });

@@ -90,9 +90,9 @@ Config comes from the environment, with a `.env` loaded at startup — first fil
 found wins, files are never merged, and the real environment always beats the
 file. Both READMEs document the search order.
 
-`npm test` (server) runs five suites. What they have in common is that all five
-guard failures that are **silent** — everything else here fails loudly, since a
-bad model id 404s and a protocol mismatch closes the socket.
+`npm test` (server) runs seven suites. What they have in common is that all
+seven guard failures that are **silent** — everything else here fails loudly,
+since a bad model id 404s and a protocol mismatch closes the socket.
 
 - `supervisor/keywords.test.ts` — the approve/deny matcher. A mistranscription
   classified as "approve" force-pushes a branch and looks like success.
@@ -111,6 +111,12 @@ bad model id 404s and a protocol mismatch closes the socket.
 - `registry/reconcile.test.ts` — registry vs. the containers that actually
   exist. A workspace reported `ready` whose container was removed weeks ago
   sends the next `load` into a timeout with no explanation.
+- `lifecycle.test.ts` — create/load/stop/delete against `container/fake.ts`.
+  `load` has several distinct failure points and the requirements doc asks each
+  to produce its own spoken error; two of them collapsing into one message is
+  invisible until someone is standing there being told the wrong thing.
+- `opencode/client.test.ts` — one test, for one hang observed against a real
+  container. See the readiness-probe gotcha below.
 
 **One thing is still worth promoting into a checked-in test**: the `.env` parser
 parity check. `client/.../env.py` hand-implements Node's `process.loadEnvFile`
@@ -283,6 +289,24 @@ Notes here should be things that cost someone time.
   removed rather than stopped. Verify shapes against the live socket:
   `curl -s --unix-socket $XDG_RUNTIME_DIR/podman/podman.sock
   'http://d/v5.0.0/libpod/containers/json?all=true'`.
+- **A rootless published port accepts connections before anything is listening
+  behind it.** Podman's port forwarder binds the host port at container start,
+  so during a workspace's first seconds a request is accepted and then simply
+  never answered — not refused. `fetch` has no default timeout, so an unbounded
+  readiness probe waits there indefinitely, and a poll loop whose probe never
+  returns never gets back to checking its own deadline: `load` hangs forever
+  with nothing after "waiting for OpenCode" in the log. `probeAgent` passes
+  `AbortSignal.timeout` for this reason. Observed, not theorised; the
+  reproduction is `opencode/client.test.ts`.
+- **Podman assigns a published port at *create* time, not at start.** Asking for
+  `host_port: 0` and reading it back from `inspect` works before the container
+  has ever run, and the port survives stop/start. That is why the registry can
+  record it at create time.
+- **The workspace container's mounts nest deliberately.** `auth.json` mounts
+  read-only *inside* the read-write per-workspace OpenCode state directory.
+  Podman orders mounts by destination depth, so this works — but it means the
+  two mounts are a pair, and changing one without the other silently gives every
+  workspace either no credentials or a shared sqlite database.
 - **OpenCode's own default model is not guaranteed to work, and the failure
   only shows up on the first forwarded turn.** `OpenCodeClient.resolveModel`
   falls back to `client.config.providers()`'s first default when

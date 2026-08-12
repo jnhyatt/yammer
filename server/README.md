@@ -68,7 +68,13 @@ halves of the system.
 | `YAMMER_OPENCODE_MODEL` | *(OpenCode's default)* | |
 | `YAMMER_OPENCODE_AGENT` | `yammer` | The TTS-aware agent; see "OpenCode agent" below |
 | `YAMMER_STATE_DIR` | *(platform data dir)* | Holds `workspaces.json`; `~/.local/share/yammer` on Linux |
-| `YAMMER_PODMAN_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Read at startup to check the workspace registry against reality |
+| `YAMMER_PODMAN_SOCKET` | `$XDG_RUNTIME_DIR/podman/podman.sock` | Required: the server exits if it cannot be reached |
+| `YAMMER_OPENCODE_IMAGE` | `localhost/yammer-opencode:latest` | Never built on demand; see "Workspace containers" below |
+| `YAMMER_WORKSPACE_ROOT` | `~/yammer-workspaces` | Where workspace working directories live on the host |
+| `YAMMER_AGENT_FILE` | `<repo>/.opencode/agent/<agent>.md` | Bind-mounted read-only into every workspace |
+| `YAMMER_OPENCODE_AUTH` | `~/.local/share/opencode/auth.json` | Provider credentials, mounted read-only |
+| `YAMMER_WORKSPACE_READY_SECONDS` | `60` | How long `load` waits for OpenCode inside the container |
+| `YAMMER_WORKSPACE_STOP_SECONDS` | `10` | Grace period before a stop becomes a kill |
 | `YAMMER_SUPERVISOR_VOICE` | `bm_george` | Approval-prompt voice; must differ audibly from `YAMMER_TTS_VOICE` |
 | `YAMMER_SUPERVISOR_ANSWER_SECONDS` | `12` | How long one answer window stays open |
 | `YAMMER_SUPERVISOR_MAX_ATTEMPTS` | `3` | Asks before giving up, then rejects and aborts |
@@ -258,12 +264,58 @@ real CUDA install and a modern GPU only needs step 1 (the EP binary) and
 `YAMMER_TTS_DEVICE=cuda`; skip the pip-wheels dance entirely if
 `ldconfig -p | grep cudart` already finds something.
 
+## Workspace containers
+
+Each workspace is one container running one `opencode serve`, created by Yammer
+over Podman's REST socket. Podman must be reachable — the server exits at
+startup if it is not, because a Yammer that cannot create or load a workspace
+would accept an utterance and then fail every command it is given:
+
+```sh
+systemctl --user enable --now podman.socket
+```
+
+**The image is never built on demand.** It is Arch plus `pacman -Syu`, so
+building it inside `create` would turn "make me a workspace" into a four-minute
+wait for a mirror. A missing image is an error naming the fix instead:
+
+```sh
+podman build -t localhost/yammer-opencode:latest -f containers/yammer-opencode/Containerfile .
+```
+
+A stale pinned image is the deliberate default; rebuild it when you want a newer
+OpenCode. Four mounts go into each container:
+
+| Host | Container | |
+| --- | --- | --- |
+| `$YAMMER_WORKSPACE_ROOT/<name>` | `/workspace` | rw — the work itself |
+| `$YAMMER_STATE_DIR/opencode/<name>` | `/root/.local/share/opencode` | rw — **per workspace** |
+| `$YAMMER_OPENCODE_AUTH` | `…/opencode/auth.json` | ro — the one shared thing |
+| `$YAMMER_AGENT_FILE` | `/root/.config/opencode/agent/<agent>.md` | ro |
+
+OpenCode's state directory is per workspace because N containers writing one
+sqlite database is a corruption risk rather than a theoretical one. Credentials
+are the exception, and they are laid back over the top of that mount read-only —
+Podman orders nested mounts by path depth, so the shallower state directory
+mounts first and `auth.json` lands inside it.
+
+The agent comes from Yammer rather than from the project being worked on: a
+fresh workspace has an empty working directory, so an agent living there would
+mean new workspaces silently running with no TTS shaping and no permission gate.
+Editing `$YAMMER_AGENT_FILE` needs no image rebuild, but does need the workspace
+restarted — OpenCode reads agent files once at boot and never hot-reloads.
+
+Ports are published on `127.0.0.1` only, with the host port chosen by the OS at
+create time and recorded in the registry. Containers never need to reach each
+other, so there is no shared network.
+
 ## Shape
 
 ```
 src/
   index.ts            entrypoint: config, warm-up, listen
   startup.ts          reads the workspace registry and checks it against Podman
+  lifecycle.ts        create/load/stop/delete for one workspace
   config.ts           environment → Config
   protocol.ts         wire types + codecs (mirrors ../protocol/PROTOCOL.md)
   ws-server.ts        handshake, framing, connection lifecycle
@@ -273,6 +325,7 @@ src/
   stt/groq.ts         OpenAI-compatible transcription
   container/runtime.ts     what Yammer needs from a container runtime
   container/podman.ts      that, over Podman's REST socket
+  container/fake.ts        that, in memory, for tests
   registry/store.ts        the workspace registry's file on disk
   registry/reconcile.ts    registry vs. reality, as a pure diff
   router/commands.ts  the meta-command catalogue
@@ -305,6 +358,12 @@ it guards a **silent** failure. Most of this repo fails loudly — a bad model i
 - `registry/store.test.ts` and `registry/reconcile.test.ts` — a workspace that
   quietly drops out of the registry, or a status that is confidently wrong,
   produce no error at the time and a mystery later.
+- `lifecycle.test.ts` — `load` has several distinct failure points and each owes
+  the user a different spoken sentence. Two of them collapsing into one message
+  is invisible until someone is standing there being told the wrong thing.
+- `opencode/client.test.ts` — one test, for one observed hang: a rootless
+  published port accepts connections before OpenCode is listening behind it, and
+  an unbounded probe waits there forever with nothing in the log.
 
 ## Evaluating router models
 

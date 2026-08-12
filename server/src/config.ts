@@ -9,7 +9,8 @@
  * overriding anything already set — see `env.ts`.
  */
 
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { loadEnvFile } from "./env.ts";
 import { defaultStateDir } from "./registry/store.ts";
@@ -67,6 +68,40 @@ export interface Config {
      * podman.socket` if reconciliation reports it unreachable.
      */
     socketPath: string;
+  };
+
+  /** Everything that goes into standing up one workspace container. */
+  workspaces: {
+    /**
+     * The image to run. Never built here: `create` must not turn into a
+     * four-minute `pacman -Syu`, so a missing image is an error telling the
+     * user to build it rather than something Yammer fixes on the spot.
+     */
+    image: string;
+    /**
+     * Host directory holding every workspace's working directory. Deliberately
+     * not under the state dir: this is where the user's actual work lives, and
+     * they push from here by hand, so it belongs somewhere they can find.
+     */
+    root: string;
+    /**
+     * The agent definition bind-mounted read-only into every container. Comes
+     * from Yammer rather than from the project being worked on, because a fresh
+     * workspace has an empty working directory and would otherwise run with no
+     * TTS shaping and no permission gate at all.
+     */
+    agentFile: string;
+    /**
+     * Provider credentials, mounted read-only. The one thing shared between
+     * workspaces — everything else in OpenCode's state directory is per
+     * workspace, because N containers writing one sqlite file is a corruption
+     * risk rather than a theoretical one.
+     */
+    authFile: string;
+    /** How long `load` waits for OpenCode inside the container to answer. */
+    readySeconds: number;
+    /** Grace period before a stop becomes a kill. */
+    stopSeconds: number;
   };
 
   supervisor: {
@@ -161,10 +196,24 @@ function defaultPodmanSocket(): string {
   return join(runtimeDir, "podman", "podman.sock");
 }
 
+/**
+ * Yammer's own checkout, two directories up from this file.
+ *
+ * Used only to find the shipped agent definition. Resolving it from the module
+ * rather than from `process.cwd()` means `npm start` from anywhere still finds
+ * it, and an installation that moves it can say so with `YAMMER_AGENT_FILE`.
+ */
+function repoRoot(): string {
+  return resolve(import.meta.dirname, "..", "..");
+}
+
 export function loadConfig(): Config {
   // Before any read of process.env below, and non-overriding, so an explicit
   // `FOO=bar npm start` still beats the file.
   const env = loadEnvFile();
+
+  const agent = optional("YAMMER_OPENCODE_AGENT", "yammer");
+  const home = homedir();
 
   return {
     envFile: env.path,
@@ -189,7 +238,7 @@ export function loadConfig(): Config {
       projectDir: required("YAMMER_PROJECT_DIR"),
       providerId: process.env["YAMMER_OPENCODE_PROVIDER"] || undefined,
       modelId: process.env["YAMMER_OPENCODE_MODEL"] || undefined,
-      agent: optional("YAMMER_OPENCODE_AGENT", "yammer"),
+      agent,
     },
 
     state: {
@@ -198,6 +247,25 @@ export function loadConfig(): Config {
 
     container: {
       socketPath: optional("YAMMER_PODMAN_SOCKET", defaultPodmanSocket()),
+    },
+
+    workspaces: {
+      image: optional("YAMMER_OPENCODE_IMAGE", "localhost/yammer-opencode:latest"),
+      root: optional("YAMMER_WORKSPACE_ROOT", join(home, "yammer-workspaces")),
+      agentFile: optional(
+        "YAMMER_AGENT_FILE",
+        join(repoRoot(), ".opencode", "agent", `${agent}.md`),
+      ),
+      authFile: optional(
+        "YAMMER_OPENCODE_AUTH",
+        join(home, ".local", "share", "opencode", "auth.json"),
+      ),
+      // Measured: a cold container answers `/agent` in about two seconds on the
+      // machine this was built for. The default is loose enough that a slow
+      // first start is not an error, and tight enough that a container which is
+      // never going to answer is reported inside a phone call's patience.
+      readySeconds: positive("YAMMER_WORKSPACE_READY_SECONDS", 60),
+      stopSeconds: positive("YAMMER_WORKSPACE_STOP_SECONDS", 10),
     },
 
     supervisor: {

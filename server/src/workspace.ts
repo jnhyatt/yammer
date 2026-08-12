@@ -24,6 +24,7 @@
 import { basename } from "node:path";
 
 import type { Config } from "./config.ts";
+import { CONTAINER_WORKDIR } from "./container/runtime.ts";
 import { log } from "./log.ts";
 import { OpenCodeClient, type UsageStats } from "./opencode/client.ts";
 import { PermissionWatcher, type PermissionRequest } from "./opencode/permissions.ts";
@@ -76,10 +77,18 @@ export class Workspace {
    */
   readonly containerId: string | null;
 
+  /** Published loopback port, or null for a workspace Yammer did not publish. */
+  readonly port: number | null;
+
+  /** ISO 8601. Informational — nothing branches on it. */
+  readonly createdAt: string;
+
   status: WorkspaceStatus;
 
   /** sessionId -> whoever is driving that conversation right now. */
   private readonly owners = new Map<string, (request: PermissionRequest) => void>();
+
+  private watching = false;
 
   constructor(options: {
     name: string;
@@ -88,6 +97,8 @@ export class Workspace {
     opencode: OpenCodeClient;
     permissions: PermissionWatcher;
     containerId?: string | null;
+    port?: number | null;
+    createdAt?: string;
     status?: WorkspaceStatus;
   }) {
     this.name = options.name;
@@ -96,16 +107,47 @@ export class Workspace {
     this.opencode = options.opencode;
     this.permissions = options.permissions;
     this.containerId = options.containerId ?? null;
+    this.port = options.port ?? null;
+    this.createdAt = options.createdAt ?? new Date().toISOString();
     this.status = options.status ?? "ready";
   }
 
-  /** Begin consuming this workspace's permission stream. */
+  /**
+   * What to persist, or null for a workspace that is not Yammer's to persist.
+   *
+   * The live objects are the single source of truth and records are derived
+   * from them, rather than the two being kept in step by hand — which is how a
+   * status ends up correct in memory and stale on disk.
+   */
+  toRecord(): WorkspaceRecord | null {
+    if (this.containerId === null || this.port === null) return null;
+    return {
+      name: this.name,
+      containerId: this.containerId,
+      workDir: this.workDir,
+      port: this.port,
+      status: this.status,
+      createdAt: this.createdAt,
+    };
+  }
+
+  /**
+   * Begin consuming this workspace's permission stream.
+   *
+   * Idempotent, because `load` calls it on every load and a workspace can be
+   * loaded by a second client while the first is still in it. Without the
+   * guard that would register a second handler and answer every permission
+   * twice, and OpenCode's second reply is a 4xx on an already-settled request.
+   */
   startWatching(): void {
+    if (this.watching) return;
+    this.watching = true;
     this.permissions.onAsked((request) => this.dispatch(request));
     this.permissions.start();
   }
 
   stopWatching(): void {
+    this.watching = false;
     this.permissions.stop();
   }
 
@@ -181,6 +223,28 @@ export class WorkspaceRegistry {
 
   list(): Workspace[] {
     return [...this.byName.values()];
+  }
+
+  /** Register a newly created workspace. Names are unique; a clash is a bug. */
+  add(workspace: Workspace): void {
+    if (this.byName.has(workspace.name)) {
+      throw new Error(`workspace ${workspace.name} already exists`);
+    }
+    this.byName.set(workspace.name, workspace);
+  }
+
+  remove(name: string): void {
+    if (name === this.defaultName) {
+      throw new Error(`the default workspace ${name} cannot be removed`);
+    }
+    this.byName.delete(name);
+  }
+
+  /** Everything worth persisting, in registration order. */
+  records(): WorkspaceRecord[] {
+    return this.list()
+      .map((workspace) => workspace.toRecord())
+      .filter((record): record is WorkspaceRecord => record !== null);
   }
 }
 
@@ -373,16 +437,18 @@ export function workspaceFromRecord(record: WorkspaceRecord, config: Config): Wo
     baseUrl,
     opencode: new OpenCodeClient({
       baseUrl,
-      // The container sees the bind mount, not the host path. Phase 2 fixes the
-      // mount point; until it does, no record-backed workspace is reachable
-      // anyway, so this is the honest placeholder rather than a wrong guess.
-      directory: record.workDir,
+      // The container sees the bind mount, not the host path. `record.workDir`
+      // is where the work lives on the host and is what Yammer reads directly;
+      // OpenCode only ever hears about the mount point.
+      directory: CONTAINER_WORKDIR,
       providerId: config.opencode.providerId,
       modelId: config.opencode.modelId,
       agent: config.opencode.agent,
     }),
-    permissions: new PermissionWatcher(baseUrl, record.workDir),
+    permissions: new PermissionWatcher(baseUrl, CONTAINER_WORKDIR),
     containerId: record.containerId,
+    port: record.port,
+    createdAt: record.createdAt,
     status: record.status,
   });
 }
