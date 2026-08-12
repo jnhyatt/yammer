@@ -280,13 +280,46 @@ src/
 ## Tests
 
 ```sh
-npm test        # node --test over src/**/*.test.ts
+npm test        # node --test over src/**/*.test.ts — 90 tests, no network
 ```
 
-Only `supervisor/keywords.ts` is covered, deliberately. Everything else in this
-repo fails loudly — a bad model id 404s, a protocol mismatch closes the socket —
-but a mistranscription classified as "approve" force-pushes a branch and looks
-like nothing went wrong. The fixtures are real Whisper output shapes.
+Three suites, and what they have in common is that all three guard failures that
+are **silent**. Everything else here fails loudly: a bad model id 404s, a
+protocol mismatch closes the socket.
+
+- `supervisor/keywords.test.ts` — the approve/deny matcher. A mistranscription
+  classified as "approve" force-pushes a branch and looks like nothing went
+  wrong. The fixtures are real Whisper output shapes.
+- `protocol.test.ts` — cross-language codec conformance. The frames it decodes
+  are dumped from the *real* Python client module by
+  `client/tools/dump_protocol_frames.py`, so it checks two implementations
+  against each other rather than checking that JSON round-trips. Regenerate that
+  fixture after any protocol change; a diff there means the other views need the
+  same edit.
+- `ws-server.test.ts` — handshake, close codes, busy rejection and the error
+  path, driving the real `startServer` with the four networked dependencies
+  faked. Its load-bearing assertion is that **every turn exit path emits
+  `turn.end`**; a path that skips it strands the client with no way back to idle.
+
+## The fake server
+
+```sh
+node --experimental-strip-types tools/fake-server.ts --port 8765
+```
+
+The real `startServer`, handshake, `TurnManager` and `PermissionSupervisor`, with
+fakes standing in for the four things that would need network — STT, the router,
+OpenCode and Kokoro. No `.env`, no API keys, no `opencode serve`, no GPU.
+
+It exists for clients in other languages: `android`'s `ServerConformanceTest`
+spawns it and drives the Kotlin client at it over a real socket, which catches
+what codec conformance cannot — frames in an order the server rejects, an
+utterance that arrives truncated, an answer that never settles.
+
+Its token is `s3cret-token`. Its STT reports how many bytes it was handed
+instead of a transcript, so a client can assert on its own audio path from the
+far end. It asks for permission on the second prompt of a session, so two turns
+exercise both paths with nothing to configure.
 
 ## Evaluating router models
 
