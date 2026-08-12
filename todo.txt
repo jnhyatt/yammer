@@ -45,13 +45,22 @@ Do not change the default without adding the failing case to
 server/src/router/eval/cases.ts first. That file is the only record of why the
 current model was chosen.
 
-## Deployment (phase 2 leftovers, mostly done in phase 5's cleanup)
+## Deployment
 
-- quadlet/yammer-opencode.container is now a template applied per workspace by
-  Yammer, not a unit systemd runs. The README in quadlet/ describes the old
-  two-unit deployment and should be re-read once Yammer itself has a unit.
-- Yammer runs uncontainerized and has no service unit of its own yet. It is
-  started by hand.
+The quadlet/ directory is gone: it described two systemd units for a server
+that now runs on the host and an OpenCode that Yammer starts itself. Nothing
+replaced it.
+
+- Yammer runs uncontainerized and has no service unit of its own. It is started
+  by hand. A single user unit plus `loginctl enable-linger` is probably all it
+  needs, but it is deliberately not written yet.
+- The workspace image is built by hand, once:
+  `podman build -t localhost/yammer-opencode:latest -f containers/yammer-opencode/Containerfile .`
+  It is Arch plus `pacman -Syu`, so it goes stale silently. There is no refresh
+  story beyond rebuilding it, on purpose — a `create` that rebuilt would be a
+  four-minute wait on a mirror.
+- `localhost/yammer-server:latest` may still be in the local image store from
+  the deleted Containerfile. Nothing uses it.
 
 ## Smaller things
 
