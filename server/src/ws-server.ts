@@ -2,8 +2,17 @@
  * WebSocket listener: handshake, framing, and connection lifecycle.
  *
  * Deliberately dumb about what a turn means — it validates frames and hands
- * them to a TurnManager. One client at a time (§ Operating assumptions); a
- * second connection is closed with ALREADY_CONNECTED.
+ * them to a TurnManager.
+ *
+ * **Several clients may connect at once**, each with its own active workspace,
+ * its own sessions, and its own turn. Everything per-client already lives in
+ * `handleConnection`, so this is mostly the absence of the old gate: there is
+ * no shared mutable state here to serialize, and the two things that look like
+ * they might be — a workspace's permission stream and its OpenCode — are keyed
+ * by session id precisely so that two clients in one workspace stay apart.
+ *
+ * "One turn at a time" survives, per connection. A person cannot say two things
+ * at once; two people can.
  */
 
 import { timingSafeEqual } from "node:crypto";
@@ -47,7 +56,7 @@ export interface Deps {
 
 export function startServer(config: Config, deps: Deps): WebSocketServer {
   const wss = new WebSocketServer({ host: config.host, port: config.port });
-  let connected: WebSocket | null = null;
+  let clients = 0;
 
   wss.on("listening", () => {
     log.info("listening", { host: config.host, port: config.port });
@@ -55,16 +64,10 @@ export function startServer(config: Config, deps: Deps): WebSocketServer {
 
   wss.on("connection", (socket, request) => {
     const peer = request.socket.remoteAddress ?? "unknown";
-
-    if (connected && connected.readyState === connected.OPEN) {
-      log.warn("rejecting second client", { peer });
-      socket.close(CloseCode.ALREADY_CONNECTED, "client already connected");
-      return;
-    }
-    connected = socket;
-
+    clients += 1;
     handleConnection(socket, peer, config, deps, () => {
-      if (connected === socket) connected = null;
+      clients -= 1;
+      log.debug("clients connected", { clients });
     });
   });
 

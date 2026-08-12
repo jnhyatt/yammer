@@ -1,4 +1,4 @@
-# Yammer WebSocket Protocol v2
+# Yammer WebSocket Protocol v3
 
 The contract between the Python client and the TypeScript server. Because the two
 halves are in different languages, this file is the single source of truth — the
@@ -21,11 +21,16 @@ Mixed-mode WebSocket.
 └────────────┴──────────────────────────────────┘
 ```
 
-Only one turn is ever in flight (the server rejects concurrent utterances), so
-the `turn_id` is not for multiplexing. It exists so that **late frames from a
-rejected or cancelled turn are discarded unambiguously** rather than by timing
-heuristic. Receivers MUST drop any binary frame whose `turn_id` does not match
-the turn they are currently accepting audio for.
+Only one turn is ever in flight **per connection** (the server rejects an
+utterance arriving while that client's turn is running), so the `turn_id` is
+not for multiplexing. It exists so that **late frames from a rejected or
+cancelled turn are discarded unambiguously** rather than by timing heuristic.
+Receivers MUST drop any binary frame whose `turn_id` does not match the turn
+they are currently accepting audio for.
+
+`turn_id`s are per connection and are not coordinated between clients. Two
+clients using the same number are two different turns, and neither can see the
+other's frames.
 
 `turn_id` is allocated by the client, starts at 1, and increments per turn. It
 wraps at 2^32.
@@ -43,7 +48,9 @@ with an error message to a failed handshake — the close code carries the reaso
 | `4001` | Authentication failed (bad or missing token) |
 | `4002` | Unsupported protocol version |
 | `4003` | Protocol violation |
-| `4004` | Server already has a connected client |
+
+**`4004` was retired in v3** and is not reused. The server accepts as many
+clients as connect; see "Connection lifecycle".
 
 ## Audio formats
 
@@ -82,7 +89,7 @@ they say the wake word rather than after speaking a sentence.
 ### `hello`
 First frame. Carries auth and capture format.
 ```json
-{ "t": "hello", "proto": 2, "token": "<shared secret>",
+{ "t": "hello", "proto": 3, "token": "<shared secret>",
   "client": "yammer-client/0.1.0",
   "audio": { "codec": "pcm_s16le", "rate": 16000, "channels": 1 } }
 ```
@@ -139,7 +146,7 @@ from speech that failed to transcribe. The server may reprompt or give up.
 
 ### `hello.ok`
 ```json
-{ "t": "hello.ok", "proto": 2, "server": "yammer-server/0.1.0",
+{ "t": "hello.ok", "proto": 3, "server": "yammer-server/0.1.0",
   "audio": { "codec": "pcm_s16le", "rate": 24000, "channels": 1 } }
 ```
 
@@ -222,8 +229,20 @@ ordinary `speech.*` segments, then `turn.end`.
   "message": "Could not reach OpenCode." }
 ```
 Codes: `stt_failed`, `stt_empty`, `router_failed`, `opencode_unreachable`,
-`opencode_error`, `tts_failed`, `supervisor_failed`, `internal`. `turn` is
-omitted for errors not associated with a turn.
+`opencode_error`, `tts_failed`, `supervisor_failed`, `workspace_unknown`,
+`workspace_start_failed`, `workspace_failed`, `internal`. `turn` is omitted for
+errors not associated with a turn.
+
+The three workspace codes are new in v3 and split by what the user would do
+about it: `workspace_unknown` is a name that resolves to nothing (never an
+implicit create), `workspace_start_failed` is a workspace that exists and did
+not come up, `workspace_failed` is everything else — a name clash, an unbuilt
+image. The spoken `message` is finer-grained than the code, deliberately: the
+code drives the client's earcon, the sentence is what the person acts on.
+
+**A client MUST tolerate an unrecognised code**, playing its error earcon and
+speaking nothing of its own. Codes are expected to grow; a new one is not a
+protocol version bump.
 
 ### `turn.end`
 The server is idle again; the client may start a new turn.
@@ -311,12 +330,26 @@ S → turn.end {turn:7, outcome:"error"}
 
 ## Connection lifecycle
 
-Disconnection abandons the in-flight turn. There is no resumption: single client,
-one turn at a time, so the server drops any in-flight work when the socket closes
-and the client starts clean on reconnect. Do not build session recovery.
+Disconnection abandons that connection's in-flight turn. There is no resumption:
+the server drops the work, and the client starts clean on reconnect. Do not
+build session recovery.
 
-The server accepts one client at a time and closes a second connection with
-`4004`.
+**Several clients may be connected at once** (v3; v2 closed the second with
+`4004`). Each connection is independent:
+
+- Its own **active workspace**. Nothing a client says moves another client, and
+  no frame tells a client which workspace it is in — it hears it. The client
+  holds no workspace state at all.
+- Its own **turn**. One turn at a time is a per-connection rule: a person cannot
+  say two things at once, but two people can, and `turn.rejected {reason:
+  "busy"}` means "you are busy", never "the server is".
+- Its own **OpenCode session per workspace**. Two clients in one workspace get
+  two independent conversations against the same OpenCode server, which is a
+  supported way to work rather than an accident.
+
+Permission prompts go to the client whose session raised them, matched by
+session identity. A prompt whose client has disconnected is refused rather than
+left blocking the container.
 
 ## Why JSON
 

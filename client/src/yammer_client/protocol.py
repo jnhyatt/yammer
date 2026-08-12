@@ -11,24 +11,26 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Final
 
-PROTOCOL_VERSION: Final = 2
+PROTOCOL_VERSION: Final = 3
 
 CLIENT_ID: Final = "yammer-client/0.1.0"
 
 
 # Application-specific WebSocket close codes.
+#
+# 4004 ALREADY_CONNECTED was retired in v3: the server takes as many clients as
+# want to connect, each with its own active workspace. The number is left unused
+# rather than recycled.
 class CloseCode:
     AUTH_FAILED: Final = 4001
     UNSUPPORTED_PROTOCOL: Final = 4002
     PROTOCOL_VIOLATION: Final = 4003
-    ALREADY_CONNECTED: Final = 4004
 
 
 CLOSE_REASONS: Final[dict[int, str]] = {
     CloseCode.AUTH_FAILED: "the server rejected the token",
     CloseCode.UNSUPPORTED_PROTOCOL: "the server speaks a different protocol version",
     CloseCode.PROTOCOL_VIOLATION: "the server reported a protocol violation",
-    CloseCode.ALREADY_CONNECTED: "another client is already connected",
 }
 
 

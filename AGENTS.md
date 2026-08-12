@@ -99,11 +99,13 @@ since a bad model id 404s and a protocol mismatch closes the socket.
 - `protocol.test.ts` — cross-language codec conformance. The frames are dumped
   from the real Python client module (see above), so this genuinely checks two
   implementations against each other rather than checking JSON round-trips.
-- `ws-server.test.ts` — handshake, close codes, busy rejection, and the error
-  path, driving the real `startServer` with the four network dependencies faked.
-  Its load-bearing assertion is the invariant below: **every turn exit path
-  emits `turn.end`.** A path that skips it strands the client with no way back
-  to idle.
+- `ws-server.test.ts` — handshake, close codes, busy rejection, multi-client
+  isolation, and the error path, driving the real `startServer` with the four
+  network dependencies faked. Its load-bearing assertion is the invariant below:
+  **every turn exit path emits `turn.end`.** A path that skips it strands the
+  client with no way back to idle. The two-client cases guard the same shape of
+  failure one level up: state that looks per-client and is not answers one
+  person out of another person's project, with nothing thrown anywhere.
 - `registry/store.test.ts` — the workspace registry's parser. A file edited by
   hand into something slightly wrong must fail at startup naming the field; a
   parser that shrugs drops a workspace out of `list` while its directory, and
@@ -239,6 +241,18 @@ Notes here should be things that cost someone time.
   had neither problem. Re-run the eval before trusting a new model here; one
   case flipping a 98% score into a critical failure is why category-average
   accuracy alone is not the metric that matters.
+- **`once(socket, "open")` on an already-open socket waits forever.** The test
+  harness did this, and it only bit when a test connected two clients before
+  awaiting either handshake — the second socket had already opened, so the
+  `open` it was waiting for never came again. Node's test runner reports it as
+  "Promise resolution is still pending but the event loop has already
+  resolved", which does not point anywhere near the cause. Check `readyState`
+  first. The same trap applies to any `once` on an event that may have fired.
+- **An unanswered permission prompt keeps the process alive for the full
+  timeout.** The supervisor's answer window is a `setTimeout` per attempt, and
+  it reprompts, so a test that asserts on `permission.ask` and then walks away
+  costs `answerSeconds × maxAttempts` of wall clock — 36s at the defaults, with
+  every test still passing. Settle the request.
 - **Whisper decides for itself whether a two-word name is one word.** In one
   live sitting, "live check" came back as `LiveCheck` when the workspace was
   created and as `live check` when it was loaded — so the workspace was made as

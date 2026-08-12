@@ -338,6 +338,13 @@ two workspaces nobody can use.
 no. It is the most destructive thing in the system and it is triggered by the
 least reliable input in it.
 
+**The active workspace is per connection.** Several clients may be connected at
+once, each in its own workspace, and nothing one client says moves another. Two
+clients in the same workspace is supported too, and they get a conversation
+each — sharing one would interleave two people's dialogue into one history. One
+turn at a time is likewise per connection: `busy` means "you are busy", never
+"the server is".
+
 Each failure has its own sentence — `src/router/commands.ts`'s
 `spokenWorkspaceError` is the whole list, one per `LifecycleFailure`. That is
 the point of the kinds existing: "OpenCode inside it never answered" and "it
@@ -388,7 +395,10 @@ it guards a **silent** failure. Most of this repo fails loudly — a bad model i
 - `protocol.test.ts` — cross-language codec conformance, against frames dumped
   from the real Python client.
 - `ws-server.test.ts` — handshake, close codes, busy rejection, permission
-  routing, and the invariant that every turn exit path emits `turn.end`.
+  routing, and the invariant that every turn exit path emits `turn.end`. Also
+  the two-client cases: server-side state that looks per-client but is not
+  raises nothing at all, it just answers one person out of another person's
+  project.
 - `registry/store.test.ts` and `registry/reconcile.test.ts` — a workspace that
   quietly drops out of the registry, or a status that is confidently wrong,
   produce no error at the time and a mystery later.

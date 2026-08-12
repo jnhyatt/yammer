@@ -67,7 +67,6 @@ describe("constants agree with the Python client", () => {
       AUTH_FAILED: CloseCode.AUTH_FAILED,
       UNSUPPORTED_PROTOCOL: CloseCode.UNSUPPORTED_PROTOCOL,
       PROTOCOL_VIOLATION: CloseCode.PROTOCOL_VIOLATION,
-      ALREADY_CONNECTED: CloseCode.ALREADY_CONNECTED,
     });
   });
 

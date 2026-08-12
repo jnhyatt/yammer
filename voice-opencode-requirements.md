@@ -22,7 +22,7 @@ The client only operates within a specific project directory it's configured for
 These are choices, not incidental facts. Changing one invalidates parts of the design.
 
 - **The user is wearing headphones or an earbud.** v1 does no acoustic echo cancellation and does not gate the microphone during playback, so synthesized speech played through a speaker will be picked up by the microphone and can trigger the client's own wake words. The earbud is a hard dependency, not a convenience. Revisit if v1 proves this impractical in the actual use context.
-- **One user, one project, one client at a time.** No multi-tenancy, no session sharing, no concurrent clients against the same server.
+- ~~**One user, one project, one client at a time.**~~ **Superseded by [yammer-server-v2.md](yammer-server-v2.md).** One user still, and no session sharing — but v2 runs a workspace per project and lifts the one-client rule: several clients may connect at once, each with its own active workspace, and two clients may share a workspace and get a conversation each. "One turn at a time" survives as a per-connection rule. This bullet is left here because it was load-bearing for v1's design and the parts of that design it shaped (per-connection turn state, the `busy` rejection) are still in place.
 - **The network between client and server is trusted-ish but not open.** See §2 for the minimum bar.
 
 ## Components

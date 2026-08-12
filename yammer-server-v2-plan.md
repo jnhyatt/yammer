@@ -8,8 +8,8 @@ supervising several per-project OpenCode containers.
 Read the requirements doc first. This file is *how* and *in what order*, not
 *what* or *why* — where the two disagree, the requirements doc wins.
 
-**Progress: phases 0–3 are done.** Each phase below carries its own status,
-including what was deviated from and why. Phases 4 and 5 are unstarted.
+**Progress: phases 0–4 are done.** Each phase below carries its own status,
+including what was deviated from and why. Phase 5 is unstarted.
 
 ## Where v1 was
 
@@ -23,7 +23,8 @@ and every phase below is downstream of unpicking them:
 - `PermissionWatcher(baseUrl, projectDir)` — one SSE stream, started once at
   boot, filtered by a single `?directory=`. *(Phase 0: one stream per workspace,
   with a session-id routing table in front of it.)*
-- `startServer` — closes a second client with `4004`. *(Still true; phase 4.)*
+- `startServer` — closes a second client with `4004`. *(Phase 4: retired, along
+  with the protocol version that named it.)*
 
 `TurnManager` and `PermissionSupervisor` are already built per-connection in
 `handleConnection`, which was a genuine head start. They just closed over the
@@ -45,7 +46,7 @@ are additive.
 | 1 | Registry, persistence, startup reconciliation | 0 | **done** |
 | 2 | Container lifecycle behind a runtime interface | 1 | **done** |
 | 3 | Workspace meta-commands + router argument extraction | 2 | **done** |
-| 4 | Multi-client, per-client active workspace, protocol v3 | 3 | not started |
+| 4 | Multi-client, per-client active workspace, protocol v3 | 3 | **done** |
 | 5 | Supervisor generalization + permission policy rework | 3 | not started |
 
 Phase 5 depends on 3, not 4 — it can land in parallel with multi-client work.
@@ -416,7 +417,7 @@ those six turns and recovered both.
 
 ---
 
-## Phase 4 — multi-client and protocol v3
+## Phase 4 — multi-client and protocol v3 ✅
 
 - Drop the `4004` single-client close. Per-client state is already
   per-connection after phase 0; the active workspace joins it.
@@ -437,6 +438,47 @@ those six turns and recovered both.
 **Done when:** two clients hold sessions in different workspaces simultaneously
 without interfering, `protocol.test.ts` passes against regenerated fixtures, and
 `ws-server.test.ts` covers the two-client case.
+
+### What landed
+
+Mostly the absence of a gate. `startServer` no longer closes the second
+connection, and everything that had to be per client already was — phase 0's
+per-connection `TurnManager` and `ClientWorkspaces`, phase 3's per-client
+active workspace. The protocol went to **3**: `4004` retired and deliberately
+not reused, so an old client meets a version mismatch rather than a close code
+that has quietly changed meaning. Three error codes joined it —
+`workspace_unknown`, `workspace_start_failed`, `workspace_failed` — split by
+what the user would do about each, with the spoken sentence still finer-grained
+than the code. PROTOCOL.md, `protocol.ts` and `protocol.py` changed together
+and the frame fixture was regenerated, as the repo requires.
+
+Two smaller things worth knowing:
+
+- **PROTOCOL.md now requires clients to tolerate an unrecognised error code.**
+  Codes are expected to grow; making each one a version bump would mean the
+  client and server cannot be updated independently for something the client
+  does not branch on anyway.
+- **v1's "one user, one project, one client at a time" assumption is now
+  annotated in [`voice-opencode-requirements.md`](voice-opencode-requirements.md)**
+  rather than left contradicting the code. That doc's own preamble says
+  changing an operating assumption invalidates parts of the design, so the
+  parts that survive are named.
+
+**What the tests found, which is what they are for:** two bugs, both in the
+test harness, both invisible until two clients existed. `once(socket, "open")`
+on an already-open socket waits forever — Node reports that as "Promise
+resolution is still pending but the event loop has already resolved", which
+points nowhere near the cause. And a test that asserted on `permission.ask`
+without answering it left the supervisor's answer window open, holding the
+process alive for 24 seconds with every test passing. Both are in AGENTS.md.
+
+**Verified:** 182/182 tests (5 new, all multi-client), clean typecheck,
+`protocol.test.ts` green against the regenerated fixture, and 17 live checks
+with **two real clients against one real server**: both handshaking at proto 3,
+creating a workspace each concurrently, loading both at once (two cold
+containers ready in ~19s), each hearing itself in its own workspace and neither
+moved by the other, and each opening a real OpenCode session inside its own
+container. No prompt was forwarded, so that cost no model tokens.
 
 ---
 

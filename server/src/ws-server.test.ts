@@ -66,7 +66,7 @@ interface FakeOptions {
   transcribe?: (audio: Buffer) => Promise<string>;
   /** Answers only. Separate because the supervisor's answers go through STT too. */
   transcribeAnswer?: (audio: Buffer) => Promise<string>;
-  route?: () => Promise<{ action: string }>;
+  route?: () => Promise<{ action: string; workspace?: string }>;
   prompt?: () => Promise<string>;
 }
 
@@ -78,18 +78,33 @@ interface Recorder {
   replies: Array<{ id: string; reply: string }>;
 }
 
+/** One fake workspace: its OpenCode, its permission stream, and what each saw. */
+interface WorkspaceFake {
+  workspace: Workspace;
+  prompts: string[];
+  replies: Array<{ id: string; reply: string }>;
+  /** The session ids this workspace's fake OpenCode has handed out. */
+  sessions: string[];
+  /** Publish a `permission.asked` as OpenCode would. */
+  emit(request: Partial<PermissionRequest> & { sessionID: string }): void;
+}
+
 /** The seam the workspace's permission stream is driven through. */
 interface Harness {
   deps: Deps;
   recorder: Recorder;
   workspace: Workspace;
+  /** A second workspace, for the tests about two clients not colliding. */
+  other: WorkspaceFake;
   /** The session id the fake OpenCode hands out, once one has been created. */
   sessionId(): string | null;
-  /** Publish a `permission.asked` as OpenCode would. */
+  /** Every session id handed out in the default workspace, in order. */
+  workspaceSessions(): string[];
   emitPermission(request: Partial<PermissionRequest> & { sessionID: string }): void;
 }
 
 const TEST_WORKSPACE = "testproject";
+const OTHER_WORKSPACE = "otherproject";
 
 function makeDeps(options: FakeOptions = {}): Harness {
   const recorder: Recorder = { audio: [], prompts: [], replies: [] };
@@ -107,20 +122,10 @@ function makeDeps(options: FakeOptions = {}): Harness {
   };
 
   const router = {
-    route: async () => (options.route ? options.route() : { action: "forward" }),
-  };
-
-  let sessionId: string | null = null;
-  const opencode = {
-    createSession: async () => {
-      sessionId = "ses_test";
-      return sessionId;
-    },
-    prompt: async (_id: string, text: string) => {
-      recorder.prompts.push(text);
-      return options.prompt ? options.prompt() : "Done.";
-    },
-    abort: async () => {},
+    route: async () => ({
+      workspace: "",
+      ...(options.route ? await options.route() : { action: "forward" }),
+    }),
   };
 
   const tts = {
@@ -130,46 +135,98 @@ function makeDeps(options: FakeOptions = {}): Harness {
     },
   };
 
-  let asked: ((request: PermissionRequest) => void) | null = null;
-  const permissions = {
-    onAsked: (handler: (request: PermissionRequest) => void) => {
-      asked = handler;
-    },
-    start: () => {},
-    stop: () => {},
-    reply: async (id: string, reply: string) => {
-      recorder.replies.push({ id, reply });
-    },
+  /**
+   * Sessions are per (client, workspace), so the fake OpenCode hands out a
+   * fresh id per call rather than one per workspace — two clients in one
+   * workspace sharing an id would make the routing table's whole job vanish.
+   */
+  function makeWorkspace(name: string): WorkspaceFake {
+    const prompts: string[] = [];
+    const replies: Array<{ id: string; reply: string }> = [];
+    const sessions: string[] = [];
+
+    const opencode = {
+      createSession: async () => {
+        const id = `ses_${name}_${sessions.length}`;
+        sessions.push(id);
+        return id;
+      },
+      prompt: async (_id: string, text: string) => {
+        prompts.push(text);
+        return options.prompt ? options.prompt() : "Done.";
+      },
+      abort: async () => {},
+    };
+
+    let asked: ((request: PermissionRequest) => void) | null = null;
+    const permissions = {
+      onAsked: (handler: (request: PermissionRequest) => void) => {
+        asked = handler;
+      },
+      start: () => {},
+      stop: () => {},
+      reply: async (id: string, reply: string) => {
+        replies.push({ id, reply });
+      },
+    };
+
+    // The concrete classes carry private fields, so structural assignment won't
+    // do. These fakes implement everything the server path touches; the cast is
+    // the price of not standing up Groq, OpenRouter, OpenCode and Kokoro.
+    const workspace = new Workspace({
+      name,
+      workDir: "/tmp",
+      baseUrl: "http://127.0.0.1:0",
+      opencode: opencode as unknown as OpenCodeClient,
+      permissions: permissions as unknown as PermissionWatcher,
+    });
+
+    return {
+      workspace,
+      prompts,
+      replies,
+      sessions,
+      emit: (request) => {
+        assert.ok(asked, `${name} is not watching its permission stream`);
+        asked({
+          id: "per_test",
+          permission: "bash",
+          patterns: ["rm -rf ."],
+          metadata: { command: "rm -rf ." },
+          always: ["rm *"],
+          ...request,
+        });
+      },
+    };
+  }
+
+  const primary = makeWorkspace(TEST_WORKSPACE);
+  const other = makeWorkspace(OTHER_WORKSPACE);
+  // The default workspace's prompts and replies are what most tests assert on.
+  recorder.prompts = primary.prompts;
+  recorder.replies = primary.replies;
+
+  const workspaces = new WorkspaceRegistry(
+    [primary.workspace, other.workspace],
+    TEST_WORKSPACE,
+  );
+
+  // Both workspaces are already up, so `load` is only ever the switch. The
+  // lifecycle's own failures have their own suite.
+  const manager = {
+    create: async (name: string) => ({ name }),
+    load: async (name: string) => ({ name }),
+    delete: async () => {},
   };
 
-  // The concrete classes carry private fields, so structural assignment won't
-  // do. These fakes implement everything the server path touches; the cast is
-  // the price of not standing up Groq, OpenRouter, OpenCode and Kokoro.
-  const workspace = new Workspace({
-    name: TEST_WORKSPACE,
-    workDir: "/tmp",
-    baseUrl: "http://127.0.0.1:0",
-    opencode: opencode as unknown as OpenCodeClient,
-    permissions: permissions as unknown as PermissionWatcher,
-  });
-  const workspaces = new WorkspaceRegistry([workspace], TEST_WORKSPACE);
-
   return {
-    deps: { stt, router, workspaces, tts } as unknown as Deps,
+    deps: { stt, router, workspaces, manager, tts } as unknown as Deps,
     recorder,
-    workspace,
-    sessionId: () => sessionId,
-    emitPermission: (request) => {
-      assert.ok(asked, "workspace is not watching its permission stream");
-      asked({
-        id: "per_test",
-        permission: "bash",
-        patterns: ["rm -rf ."],
-        metadata: { command: "rm -rf ." },
-        always: ["rm *"],
-        ...request,
-      });
-    },
+    workspace: primary.workspace,
+    other,
+    sessionId: () => primary.sessions.at(-1) ?? null,
+    workspaceSessions: () => primary.sessions,
+    emitPermission: (request) => primary.emit(request),
   };
 }
 
@@ -230,8 +287,17 @@ class TestClient {
     this.socket.on("error", () => {});
   }
 
-  open(): Promise<unknown[]> {
-    return once(this.socket, "open");
+  /**
+   * Resolve once connected — including when it already is.
+   *
+   * `once` waits for the *next* event, so a socket that opened while the test
+   * was doing something else would wait for a second `open` that never comes.
+   * That only happens when more than one client is connected at a time, which
+   * is exactly what the multi-client tests do.
+   */
+  async open(): Promise<void> {
+    if (this.socket.readyState === this.socket.OPEN) return;
+    await once(this.socket, "open");
   }
 
   send(raw: string | Buffer): void {
@@ -394,7 +460,9 @@ describe("handshake", () => {
     });
   });
 
-  it("closes a second client with 4004 and leaves the first alone", async () => {
+  it("accepts a second client alongside the first", async () => {
+    // v2 closed this connection with 4004. Both being usable at once is the
+    // capability, and the first still working is the regression risk.
     const { deps } = makeDeps();
     await withServer(deps, async (connect) => {
       const first = connect();
@@ -402,10 +470,9 @@ describe("handshake", () => {
       await first.ofType("hello.ok");
 
       const second = connect();
-      assert.equal((await second.closed).code, CloseCode.ALREADY_CONNECTED);
+      await second.hello();
+      assert.equal((await second.ofType("hello.ok"))["proto"], PROTOCOL_VERSION);
 
-      // The incumbent is still usable, which is the whole point of rejecting
-      // the newcomer rather than taking over.
       first.send(JSON.stringify({ t: "utterance.begin", turn: 1 }));
       assert.equal((await first.ofType("turn.accepted"))["turn"], 1);
     });
@@ -552,6 +619,179 @@ describe("turn lifecycle", () => {
 
       client.send(JSON.stringify({ t: "utterance.begin", turn: 6 }));
       assert.equal((await client.ofType("turn.accepted"))["turn"], 6);
+    });
+  });
+});
+
+// --- Two clients -----------------------------------------------------------
+
+describe("multiple clients", () => {
+  // Protocol v3 lifted the one-client rule. The failures this guards are all
+  // of the same shape: server-side state that looks per-client but is not, so
+  // one person's utterance lands in another person's project. None of them
+  // would raise anything — the reply just comes back from the wrong codebase.
+
+  /** Connect, authenticate, and run one utterance to completion. */
+  async function turn(client: TestClient, id: number): Promise<Record<string, unknown>> {
+    client.send(JSON.stringify({ t: "utterance.begin", turn: id }));
+    await client.next((m) => m["t"] === "turn.accepted" && m["turn"] === id, "turn.accepted");
+    client.send(encodeAudioFrame(id, Buffer.from([1, 0])));
+    client.send(JSON.stringify({ t: "utterance.end", turn: id }));
+    return client.next((m) => m["t"] === "turn.end" && m["turn"] === id, "turn.end");
+  }
+
+  it("keeps two clients in different workspaces out of each other's way", async () => {
+    // One client says "load otherproject"; the other says nothing about
+    // workspaces at all and must stay where it started.
+    let route: { action: string; workspace?: string } = { action: "forward" };
+    const harness = makeDeps({ route: async () => route });
+
+    await withServer(harness.deps, async (connect) => {
+      const mover = connect();
+      const stayer = connect();
+      for (const client of [mover, stayer]) {
+        await client.hello();
+        await client.ofType("hello.ok");
+      }
+
+      route = { action: "load_workspace", workspace: "other project" };
+      assert.equal((await turn(mover, 1))["outcome"], "meta_command");
+
+      route = { action: "forward" };
+      assert.equal((await turn(mover, 2))["outcome"], "forwarded");
+      assert.equal((await turn(stayer, 2))["outcome"], "forwarded");
+
+      assert.deepEqual(
+        harness.other.prompts,
+        ["add a test"],
+        "the client that moved should be prompting the workspace it moved to",
+      );
+      assert.deepEqual(
+        harness.recorder.prompts,
+        ["add a test"],
+        "the client that said nothing about workspaces should not have moved",
+      );
+    });
+  });
+
+  it("gives two clients in one workspace a session each", async () => {
+    const harness = makeDeps();
+    await withServer(harness.deps, async (connect) => {
+      const first = connect();
+      const second = connect();
+      for (const client of [first, second]) {
+        await client.hello();
+        await client.ofType("hello.ok");
+      }
+
+      await turn(first, 1);
+      await turn(second, 1);
+
+      // Same workspace, same turn number, two conversations. Sharing one would
+      // interleave two people's dialogue into one history.
+      assert.equal(harness.recorder.prompts.length, 2);
+      assert.equal(new Set(harness.workspaceSessions()).size, 2);
+    });
+  });
+
+  it("asks the client whose session raised the permission, and only that one", async () => {
+    const gate = deferred<string>();
+    const harness = makeDeps({ prompt: () => gate.promise });
+    harness.workspace.startWatching();
+
+    await withServer(harness.deps, async (connect) => {
+      const asker = connect();
+      const bystander = connect();
+      for (const client of [asker, bystander]) {
+        await client.hello();
+        await client.ofType("hello.ok");
+      }
+
+      // Both are mid-turn, so "there is a turn in flight" cannot be what picks
+      // the right client — only the session id can.
+      asker.send(JSON.stringify({ t: "utterance.begin", turn: 40 }));
+      await asker.ofType("turn.accepted");
+      asker.send(JSON.stringify({ t: "utterance.end", turn: 40 }));
+      await waitFor(() => harness.workspaceSessions().length === 1, "the first session");
+      const askerSession = harness.workspaceSessions()[0]!;
+
+      bystander.send(JSON.stringify({ t: "utterance.begin", turn: 41 }));
+      await bystander.ofType("turn.accepted");
+      bystander.send(JSON.stringify({ t: "utterance.end", turn: 41 }));
+      await waitFor(() => harness.workspaceSessions().length === 2, "the second session");
+
+      harness.emitPermission({ id: "per_asker", sessionID: askerSession });
+
+      const ask = await asker.ofType("permission.ask");
+      assert.equal(ask["turn"], 40);
+      assert.ok(
+        !bystander.seen().includes("permission.ask"),
+        "the other client must not be asked about a tool call it did not cause",
+      );
+
+      // Answer it. Not politeness: an unanswered prompt leaves the supervisor
+      // holding its answer window open for the full timeout, and the request
+      // blocked at OpenCode — which is the state this whole path exists to
+      // avoid, and which shows up here as a suite that takes 24 seconds.
+      asker.send(JSON.stringify({ t: "answer.begin", turn: 40, id: "per_asker" }));
+      asker.send(encodeAudioFrame(40, Buffer.from([1, 0])));
+      asker.send(JSON.stringify({ t: "answer.end", turn: 40, id: "per_asker" }));
+      assert.equal((await asker.ofType("permission.resolved"))["response"], "once");
+      assert.deepEqual(harness.recorder.replies, [{ id: "per_asker", reply: "once" }]);
+
+      gate.resolve("Done.");
+    });
+  });
+
+  it("rejects a busy client's second utterance without touching the other", async () => {
+    // `busy` means "you are busy", not "the server is". A person cannot say two
+    // things at once; two people can.
+    const gate = deferred<string>();
+    const harness = makeDeps({ transcribe: () => gate.promise });
+
+    await withServer(harness.deps, async (connect) => {
+      const busy = connect();
+      const idle = connect();
+      for (const client of [busy, idle]) {
+        await client.hello();
+        await client.ofType("hello.ok");
+      }
+
+      busy.send(JSON.stringify({ t: "utterance.begin", turn: 1 }));
+      await busy.ofType("turn.accepted");
+      busy.send(JSON.stringify({ t: "utterance.end", turn: 1 }));
+      await busy.next((m) => m["t"] === "turn.status" && m["state"] === "transcribing", "transcribing");
+
+      busy.send(JSON.stringify({ t: "utterance.begin", turn: 2 }));
+      assert.equal((await busy.ofType("turn.rejected"))["reason"], "busy");
+
+      idle.send(JSON.stringify({ t: "utterance.begin", turn: 2 }));
+      assert.equal((await idle.ofType("turn.accepted"))["turn"], 2);
+
+      gate.resolve("add a test");
+    });
+  });
+
+  it("leaves the other client alone when one disconnects mid-turn", async () => {
+    const gate = deferred<string>();
+    const harness = makeDeps({ prompt: () => gate.promise });
+
+    await withServer(harness.deps, async (connect) => {
+      const leaver = connect();
+      const stayer = connect();
+      for (const client of [leaver, stayer]) {
+        await client.hello();
+        await client.ofType("hello.ok");
+      }
+
+      leaver.send(JSON.stringify({ t: "utterance.begin", turn: 1 }));
+      await leaver.ofType("turn.accepted");
+      leaver.send(JSON.stringify({ t: "utterance.end", turn: 1 }));
+      await waitFor(() => harness.workspaceSessions().length === 1, "the session");
+      leaver.close();
+
+      gate.resolve("Done.");
+      assert.equal((await turn(stayer, 1))["outcome"], "forwarded");
     });
   });
 });

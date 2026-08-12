@@ -10,6 +10,7 @@
  * uses it to return to idle.
  */
 
+import { WorkspaceLifecycleError } from "./lifecycle.ts";
 import { log } from "./log.ts";
 import { OpenCodeError } from "./opencode/client.ts";
 import type { PermissionRequest } from "./opencode/permissions.ts";
@@ -25,7 +26,7 @@ import { RouterError, type Router } from "./router/router.ts";
 import { SttClient, SttError } from "./stt/groq.ts";
 import type { PermissionContext, PermissionSupervisor } from "./supervisor/supervisor.ts";
 import { TtsEngine, TtsError } from "./tts/kokoro.ts";
-import type { ClientWorkspaces, WorkspaceSession } from "./workspace.ts";
+import { WorkspaceUnknownError, type ClientWorkspaces, type WorkspaceSession } from "./workspace.ts";
 
 /** How the orchestrator talks back to whoever owns the socket. */
 export interface TurnSink {
@@ -285,11 +286,8 @@ export class TurnManager {
         // A workspace command's failures have their own sentences — the
         // requirements doc asks for one per failure point, and they are the
         // only thing the user gets to diagnose from.
-        // One wire code for all of them for now: the client plays the same
-        // earcon whatever it says, and the sentence carries the difference.
-        // Phase 4's protocol bump is where they get codes of their own.
         const workspaceError = spokenWorkspaceError(cause);
-        if (workspaceError) return this.fail(id, "internal", workspaceError, cause);
+        if (workspaceError) return this.fail(id, workspaceCode(cause), workspaceError, cause);
         return this.fail(id, opencodeCode(cause), spokenOpencodeError(cause), cause);
       }
     }
@@ -388,6 +386,22 @@ function spokenSttError(cause: unknown): string {
     return "I didn't catch that.";
   }
   return "I couldn't transcribe that.";
+}
+
+/** Which of the three workspace codes a lifecycle failure is. */
+function workspaceCode(cause: unknown): ErrorCode {
+  if (cause instanceof WorkspaceUnknownError) return "workspace_unknown";
+  if (!(cause instanceof WorkspaceLifecycleError)) return "internal";
+  switch (cause.kind) {
+    case "container-gone":
+    case "start-failed":
+    case "port-drift":
+    case "not-ready":
+    case "agent-missing":
+      return "workspace_start_failed";
+    default:
+      return "workspace_failed";
+  }
 }
 
 function opencodeCode(cause: unknown): ErrorCode {
